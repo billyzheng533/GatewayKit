@@ -172,18 +172,59 @@ function singleHeader(value: string | string[] | undefined): string | undefined 
   return Array.isArray(value) ? value[0] : value;
 }
 
-async function readBody(req: IncomingMessage, limitBytes: number): Promise<Buffer> {
-  const declared = Number(req.headers['content-length']);
-  if (Number.isFinite(declared) && declared > limitBytes) throw new PayloadTooLargeError(limitBytes);
+/** How long to keep draining an oversized body before giving up on the connection. */
+const DISCARD_BODY_MS = 5_000;
 
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    size += (chunk as Buffer).length;
-    if (size > limitBytes) throw new PayloadTooLargeError(limitBytes);
-    chunks.push(chunk as Buffer);
-  }
-  return Buffer.concat(chunks);
+function readBody(req: IncomingMessage, limitBytes: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > limitBytes) {
+      discardBody(req);
+      reject(new PayloadTooLargeError(limitBytes));
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    let size = 0;
+    const cleanup = () => {
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('close', onClose);
+    };
+    const onData = (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limitBytes) {
+        cleanup();
+        discardBody(req);
+        reject(new PayloadTooLargeError(limitBytes));
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve(Buffer.concat(chunks));
+    };
+    const onClose = () => {
+      cleanup();
+      if (!req.complete) reject(new Error('client disconnected while sending the request body'));
+    };
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('close', onClose);
+  });
+}
+
+/**
+ * Reads and drops the rest of an oversized body. Stopping mid-upload would
+ * reset the connection, and most clients would then report a broken pipe
+ * instead of our 413. Draining is bounded in time so a client can't stream forever.
+ */
+function discardBody(req: IncomingMessage): void {
+  const timer = setTimeout(() => req.destroy(), DISCARD_BODY_MS);
+  timer.unref();
+  req.once('end', () => clearTimeout(timer));
+  req.resume();
 }
 
 async function sendResponse(res: ServerResponse, response: GatewayResponse, requestId: string, logger: Logger): Promise<void> {

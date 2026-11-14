@@ -106,6 +106,9 @@ Key choices:
 - **Request bodies are buffered** (capped at 10 MB → 413). That's needed to replay a body on retry and
   to rewrite it in `request_transform`. The trade-off is memory per in-flight request and no streaming
   uploads; a production version would buffer only on routes that need it and stream otherwise.
+- **Oversized bodies get a clean 413.** Stopping the read mid-upload resets the connection, and
+  clients then report a broken pipe instead of the 413 (a test caught this). The gateway sends the 413
+  and drains the rest of the body in the background, for at most 5 seconds.
 - **Response bodies stream** straight through to the client unless a feature needs to buffer them.
 - **Client disconnects cancel the upstream request** via an `AbortSignal`, so abandoned requests don't
   keep upstream work going.
@@ -182,7 +185,17 @@ target), health checks, request/response transforms. The gateway logs a startup 
 - **Integration tests** that start real mock upstreams and a real gateway on random ports and talk
   to them over HTTP. They cover the non-negotiables, header forwarding, 502/504, 50 concurrent
   requests, retry (recovery, giving up, timeouts, backoff timing, no POST duplication) and the circuit
-  breaker opening, rejecting without calling the upstream, and recovering. They build configs through the same YAML loader as production and use different routes,
+  breaker opening, rejecting without calling the upstream, and recovering. `strip_prefix` has its own
+  file checking exactly what path and query string the upstream receives, including edge cases
+  (trailing slash, encoded characters, an upstream URL with a base path).
+- **Failure tests** (`test/failures.test.ts`) cover how the gateway behaves when things break: an
+  upstream that resets the connection, answers with non-HTTP bytes, dies halfway through a response,
+  never answers, or restarts on the same port; 50 requests at once to a dead upstream; a client that
+  hangs up mid-request (the upstream request is cancelled) or mid-upload. Every test also checks the
+  gateway keeps serving afterwards.
+- **CLI tests** start the real `src/index.ts` as a separate process: config from an argument or
+  `GATEWAY_CONFIG`, refusal to start on an invalid or missing config (exit 1), usage message (exit 2),
+  and a clean exit 0 on SIGTERM. They build configs through the same YAML loader as production and use different routes,
   ports and timeouts than `gateway.yaml`, which also exercises "works with any valid config".
 - The mock upstream (`mock/upstream.ts`) echoes requests and has slow, flaky and fixed-status
   endpoints for failure cases. `npm run mock` starts it on the example config's ports.

@@ -84,6 +84,9 @@ the gateway forwarded. It also has endpoints for failure cases, under any path p
 | `/slow?ms=<n>` | Waits `n` ms, then echoes |
 | `/flaky?fail=<n>&key=<k>` | Returns 503 for the first `n` calls with that key (default `default`), then echoes |
 | `/healthz` | Health check endpoint, returns 200 |
+| `/reset` | Drops the connection without responding |
+| `/truncate` | Sends headers and part of the body, then drops the connection |
+| `/garbage` | Answers with bytes that aren't HTTP |
 
 For example, `curl -i localhost:8080/api/users/slow?ms=40000` shows the 504 after the 30s global timeout.
 
@@ -103,13 +106,30 @@ for i in 1 2 3 4 5 6; do curl -s localhost:8080/api/internal/status/500; echo; d
 
 ## Running the tests
 
+After `npm install`, the whole suite runs with one command:
+
 ```bash
 npm test
 ```
 
-The suite is self-contained: integration tests start real mock upstream servers and a real gateway on random
-ports, so nothing else needs to be running and nothing collides with port 8080. Type-check with
-`npm run typecheck`.
+**It's self-contained.** You don't need to start the mock servers or the gateway, and nothing needs to be
+running on port 8080. Each test file starts its own mock upstream servers (`mock/upstream.ts`) and its own
+gateway, both on random free ports, and shuts them down afterwards. The CLI tests start the real gateway
+as a separate process. A full run takes about 2 seconds.
+
+Type-check with `npm run typecheck`, or re-run tests on every change with `npm run test:watch`.
+
+| File | Kind | What it covers |
+| --- | --- | --- |
+| `test/config.test.ts` | Unit | Loading `gateway.yaml`, defaults, and rejecting malformed configs with every error listed |
+| `test/duration.test.ts` | Unit | Duration strings (`"500ms"`, `"30s"`, ...) and invalid ones |
+| `test/router.test.ts` | Unit | Prefix matching, most-specific-route wins, path rewriting |
+| `test/circuitBreaker.test.ts` | Unit | Breaker state machine with a fake clock: opening, cooldown, half-open trial |
+| `test/gateway.test.ts` | Integration | `/health`, proxying, 404, 405, headers, 502, 504, 413, 50 concurrent requests |
+| `test/stripPrefix.test.ts` | Integration | Exactly which path and query string the upstream receives |
+| `test/resilience.test.ts` | Integration | Retry (recovery, giving up, backoff, no duplicate POSTs) and circuit breaker |
+| `test/failures.test.ts` | Integration | Upstreams that reset, send garbage, die mid-response, hang, or restart; clients that disconnect |
+| `test/cli.test.ts` | Integration | Starting the real gateway: config from an argument or `GATEWAY_CONFIG`, bad config exits 1, SIGTERM exits 0 |
 
 ## Config feature checklist
 

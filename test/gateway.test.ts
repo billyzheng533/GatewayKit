@@ -1,5 +1,6 @@
+import http from 'node:http';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import type { RunningGateway } from '../src/server.js';
+import { MAX_BODY_BYTES, type RunningGateway } from '../src/server.js';
 import { startMockUpstream, type MockUpstream } from '../mock/upstream.js';
 import { closedPort, startTestGateway } from './helpers.js';
 
@@ -177,5 +178,55 @@ describe('concurrency', () => {
     const bodies = await Promise.all(responses.map(json));
     expect(responses.every((res) => res.status === 200)).toBe(true);
     expect(new Set(bodies.map((b) => b.path)).size).toBe(50);
+  });
+});
+
+describe('request limits and header hygiene', () => {
+  it('rejects a body over the 10 MB limit with 413 without calling the upstream', async () => {
+    const before = users.requests.length;
+    const res = await get('/api/users', { method: 'POST', body: Buffer.alloc(MAX_BODY_BYTES + 1) });
+    expect(res.status).toBe(413);
+    expect(await json(res)).toMatchObject({ error: 'payload_too_large' });
+    expect(users.requests.length).toBe(before);
+  });
+
+  it('rejects an oversized chunked body (no Content-Length) with 413', async () => {
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = http.request(`${gateway.url}/api/users`, { method: 'POST' }, (res) => {
+        res.resume();
+        resolve(res.statusCode ?? 0);
+      });
+      req.on('error', reject);
+      const chunk = Buffer.alloc(1024 * 1024);
+      for (let i = 0; i <= MAX_BODY_BYTES / chunk.length; i += 1) req.write(chunk);
+      req.end();
+    });
+    expect(status).toBe(413);
+  });
+
+  it('does not forward hop-by-hop headers, including ones named in Connection', async () => {
+    // fetch() won't let us set Connection, so use the raw http client.
+    const body = await new Promise<string>((resolve, reject) => {
+      const req = http.request(
+        `${gateway.url}/api/users`,
+        { headers: { connection: 'keep-alive, x-hop-secret', 'x-hop-secret': 'drop me', 'keep-alive': 'timeout=5', 'x-end-to-end': 'keep me' } },
+        (res) => {
+          let data = '';
+          res.on('data', (chunk) => (data += chunk));
+          res.on('end', () => resolve(data));
+        },
+      );
+      req.on('error', reject);
+      req.end();
+    });
+    const { headers } = JSON.parse(body);
+    expect(headers['x-end-to-end']).toBe('keep me');
+    expect(headers['x-hop-secret']).toBeUndefined();
+    expect(headers['keep-alive']).toBeUndefined();
+  });
+
+  it('answers HEAD /health', async () => {
+    const res = await get('/health', { method: 'HEAD' });
+    expect(res.status).toBe(200);
   });
 });

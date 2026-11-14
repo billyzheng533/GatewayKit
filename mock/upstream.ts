@@ -10,6 +10,9 @@ import type { AddressInfo } from 'node:net';
  *   ANY  /slow?ms=<n>      waits n milliseconds, then echoes
  *   ANY  /flaky?fail=<n>&key=<k>   fails with 503 for the first n calls with that key
  *                          (default key "default"), then echoes
+ *   ANY  /reset            destroys the connection without responding
+ *   ANY  /truncate         sends headers and part of the body, then destroys the connection
+ *   ANY  /garbage          answers with bytes that aren't HTTP
  *   ANY  anything else     echoes the request back as JSON
  *
  * Every response carries `Server` and `X-Powered-By` headers (so header removal
@@ -21,6 +24,8 @@ export interface RecordedRequest {
   url: string;
   headers: http.IncomingHttpHeaders;
   body: string;
+  /** Set when the caller (the gateway) closed the connection before the response finished. */
+  callerDisconnected: boolean;
 }
 
 export interface MockUpstream {
@@ -42,8 +47,17 @@ export async function startMockUpstream(name: string, port = 0): Promise<MockUps
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
     const body = Buffer.concat(chunks).toString('utf8');
-    const recorded: RecordedRequest = { method: req.method ?? 'GET', url: req.url ?? '/', headers: req.headers, body };
+    const recorded: RecordedRequest = {
+      method: req.method ?? 'GET',
+      url: req.url ?? '/',
+      headers: req.headers,
+      body,
+      callerDisconnected: false,
+    };
     requests.push(recorded);
+    res.on('close', () => {
+      if (!res.writableFinished) recorded.callerDisconnected = true;
+    });
 
     const url = new URL(recorded.url, 'http://mock.local');
     const segments = url.pathname.split('/').filter(Boolean);
@@ -74,6 +88,20 @@ export async function startMockUpstream(name: string, port = 0): Promise<MockUps
       const ms = Number(url.searchParams.get('ms') ?? 1000);
       await new Promise((resolve) => setTimeout(resolve, ms));
       if (!res.destroyed) echo();
+      return;
+    }
+    if (last === 'reset') {
+      req.socket.destroy();
+      return;
+    }
+    if (last === 'truncate') {
+      res.writeHead(200, { 'content-type': 'text/plain', 'content-length': '1000' });
+      res.write('only part of the body');
+      setTimeout(() => req.socket.destroy(), 20);
+      return;
+    }
+    if (last === 'garbage') {
+      req.socket.end('this is not an HTTP response\r\n\r\n');
       return;
     }
     if (last === 'flaky') {

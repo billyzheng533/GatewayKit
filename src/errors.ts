@@ -83,8 +83,14 @@ export class CircuitOpenError extends GatewayError {
   }
 }
 
+/**
+ * The request body is over the limit: 413. No `Connection: close` here: Node
+ * would close the socket while the client is still uploading, and the client
+ * would see a broken pipe instead of this response. The server drains the
+ * rest of the body (time-bounded) instead.
+ */
 export class PayloadTooLargeError extends GatewayError {
   constructor(limitBytes: number) {
-    super(413, 'payload_too_large', `request body exceeds ${limitBytes} bytes`, { connection: 'close' });
+    super(413, 'payload_too_large', `request body exceeds ${limitBytes} bytes`);
   }
 }
