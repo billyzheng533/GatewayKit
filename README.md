@@ -104,6 +104,16 @@ curl -i "localhost:8080/api/orders/flaky?fail=2&key=demo"
 for i in 1 2 3 4 5 6; do curl -s localhost:8080/api/internal/status/500; echo; done
 ```
 
+**Auth:** `/api/internal` needs one of the configured keys in `X-API-Key`. Without one you get 401:
+
+```bash
+curl -i localhost:8080/api/internal/stats
+```
+
+```bash
+curl -i -H 'X-API-Key: sk_live_abc123' localhost:8080/api/internal/stats
+```
+
 **Rate limiting:** `/api/orders` allows 10 requests per 10 seconds per client. The 11th and 12th get 429
 with `{"error":"rate_limited",...,"retry_after":10}`, and every response carries `X-RateLimit-*` headers:
 
@@ -138,6 +148,7 @@ Type-check with `npm run typecheck`, or re-run tests on every change with `npm r
 | `test/stripPrefix.test.ts` | Integration | Exactly which path and query string the upstream receives |
 | `test/pathSecurity.test.ts` | Integration | `..` tricks that try to escape a route's prefix, sent raw so the client can't tidy them up |
 | `test/resilience.test.ts` | Integration | Retry (recovery, giving up, backoff, no duplicate POSTs) and circuit breaker |
+| `test/auth.test.ts` | Unit + integration | Valid and invalid keys, key not forwarded, duplicate headers, `..` tricks, failed guesses hitting the rate limit |
 | `test/rateLimit.test.ts` | Integration | 429s and headers, 50 simultaneous requests, window resets, per IP vs. global, inherited limits |
 | `test/failures.test.ts` | Integration | Upstreams that reset, send garbage, die mid-response, hang, or restart; clients that disconnect |
 | `test/cli.test.ts` | Integration | Starting the real gateway: config from an argument or `GATEWAY_CONFIG`, bad config exits 1, SIGTERM exits 0 |
@@ -158,7 +169,7 @@ Type-check with `npm run typecheck`, or re-run tests on every change with `npm r
 | `global_timeout` / `upstream.timeout` (504 on timeout, 502 when unreachable) | ✅ |
 | `global_rate_limit` / `rate_limit` (`fixed_window`, `sliding_window`, `per: ip / global`) | ✅ |
 | `retry` (`fixed` / `exponential` backoff, `on` status codes; POST only retried if never sent) | ✅ |
-| `auth` (`api_key`) | ⏳ parsed, not enforced |
+| `auth` (`api_key`: constant-time key check, 401, key not forwarded upstream) | ✅ |
 | `circuit_breaker` (`threshold` in `window`, `cooldown`, half-open trial, 503 with `retry_after`) | ✅ |
 | `upstream.targets` load balancing (`round_robin`, `weighted_round_robin`) | ⏳ uses first target |
 | `health_check` | ⏳ parsed, not enforced |

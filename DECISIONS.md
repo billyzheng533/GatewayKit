@@ -158,6 +158,20 @@ The brief says ambiguities are intentional; these are the calls I made:
 | Breaker per route or per target? | Per route, since that's where the config lives. With load balancing it should become per target, so one bad target doesn't block healthy ones. |
 | Retry and breaker on the same route | Retry wraps the breaker. Each attempt counts as a separate breaker result, and once the breaker opens mid-retry, the remaining attempts stop instead of hammering a failing upstream. A breaker rejection is never retried. |
 
+### Auth
+
+| Question | Decision |
+| --- | --- |
+| Missing key vs. wrong key | Both get 401 `{ "error": "unauthorized", "message": "..." }`, with different messages and a `WWW-Authenticate: ApiKey header="X-API-Key"` header. 403 would mean "we know who you are, but no", which doesn't apply to a bad key. |
+| How are keys compared? | In constant time: both sides are hashed with SHA-256 and compared with `crypto.timingSafeEqual`, checking every configured key with no early exit. Response timing can't be used to guess a key character by character, or to learn its length. |
+| Is the key forwarded to the upstream? | No. Authentication ends at the gateway, so the header is removed. The upstream and its logs never see the client's secret. |
+| Is the key logged? | No. Access logs record method, path, route and status, never headers. |
+| Header name case | Case-insensitive, like all HTTP headers: `X-API-Key` and `x-api-key` both work. Key values are case-sensitive. |
+| The key header sent twice | 401, even if one copy is valid. Which copy the gateway checks shouldn't be up to the client. |
+| Auth before or after rate limiting? | After. If auth ran first, rejected requests would never reach the rate limiter, and someone could try keys as fast as the network allows. Now every failed guess uses up that client's budget. The trade-off: on a route with `per: "global"`, unauthenticated requests use up the shared budget too, so an attacker could crowd out legitimate users. A production version would add a separate limit on failed auth attempts. |
+| Do 401s count as circuit breaker failures? | No. Auth rejects before any upstream call, so the upstream's health isn't involved. |
+| Bypass with `..` through an open route | Not possible: paths are normalized first, so `/api/open/../internal` is routed (and authenticated) as `/api/internal`. |
+
 ### Rate limiting
 
 | Question | Decision |
@@ -170,7 +184,7 @@ The brief says ambiguities are intentional; these are the calls I made:
 | What does a client see? | 429 `{ "error": "rate_limited", "message": "...", "retry_after": <seconds> }` with a `Retry-After` header. Every response on a rate-limited route carries `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset` (seconds until the budget is full again). |
 | 50 simultaneous requests | Exactly `requests` get through. Each check-and-increment is synchronous on Node's single thread, so concurrent requests can't race on a counter. There's a test for exactly this. |
 | Memory for many clients | Idle clients' counters are swept once per window, so memory tracks active clients rather than every client ever seen. |
-| Where in the pipeline? | Outermost, before retry and the breaker: rejecting an over-limit client is the cheapest thing the gateway can do. Auth will go in front of it. |
+| Where in the pipeline? | Outermost, before auth, retry and the breaker: rejecting an over-limit client is the cheapest thing the gateway can do. Running before auth is deliberate; see the auth table. |
 | Running several gateway instances | Limits are per instance (in memory). A shared store like Redis would be needed for a cluster-wide limit. |
 
 ## Current state
@@ -198,13 +212,17 @@ The brief says ambiguities are intentional; these are the calls I made:
    `..` in a path escaped the route prefix (`/api/products/../internal/secret` reached
    `/internal/secret` on the products service). Fixed before adding more features, with tests that
    send raw paths, since `fetch` and `curl` tidy up `..` themselves and would hide the problem.
+7. **Auth.** Until now, `/api/internal` accepted anyone, which was the most serious gap. API keys are
+   checked in constant time, removed before forwarding, never logged, and checked after rate
+   limiting so failed guesses are throttled. Checked with the example config, including the `..`
+   path from step 6, which now gets a 401.
 
 **Done and tested:** config loading and validation of the full schema, `/health`, routing, 404, 405,
 proxying (headers, body, query string, streaming), `strip_prefix`, per-route and global timeouts, 502/504
 handling, request IDs, access logs, graceful shutdown, retry with fixed/exponential backoff, circuit
-breaker, rate limiting (fixed and sliding window, per IP or global).
+breaker, rate limiting (fixed and sliding window, per IP or global), path normalization, API key auth.
 
-**Parsed and validated but not enforced yet:** auth, load balancing (all traffic goes to the first
+**Parsed and validated but not enforced yet:** load balancing (all traffic goes to the first
 target), health checks, request/response transforms. The gateway logs a startup warning for each.
 
 ## Testing approach

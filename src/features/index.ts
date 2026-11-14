@@ -1,6 +1,7 @@
 import type { GatewayConfig, RouteConfig } from '../config/types.js';
 import type { Logger } from '../logger.js';
 import type { Middleware } from '../pipeline.js';
+import { authFeature } from './auth/index.js';
 import { circuitBreakerFeature } from './circuitBreaker/index.js';
 import { rateLimitFeature } from './rateLimit/index.js';
 import { retryFeature } from './retry/index.js';
@@ -32,12 +33,15 @@ export interface Feature {
 
 /**
  * Pipeline order, outermost first:
- *   rate_limit       reject over-limit clients before doing any work
+ *   rate_limit       reject over-limit clients before doing any work. It runs
+ *                    before auth on purpose: failed key guesses use up the
+ *                    budget, so keys can't be brute-forced at full speed
+ *   auth             reject requests without a valid key before any upstream work
  *   retry            wraps the breaker, so each attempt is counted separately
  *                    and retrying stops once the breaker opens
  *   circuit_breaker  innermost, closest to the upstream call
  */
-export const FEATURES: readonly Feature[] = [rateLimitFeature, retryFeature, circuitBreakerFeature];
+export const FEATURES: readonly Feature[] = [rateLimitFeature, authFeature, retryFeature, circuitBreakerFeature];
 
 export function buildRouteMiddleware(route: RouteConfig, deps: FeatureDeps): Middleware[] {
   return FEATURES.map((feature) => feature.create(route, deps)).filter((mw): mw is Middleware => mw !== null);
@@ -51,7 +55,6 @@ const NOT_YET_ENFORCED: Array<[keyof RouteConfig, string]> = [
   ['healthCheck', 'health_check'],
   ['requestTransform', 'request_transform'],
   ['responseTransform', 'response_transform'],
-  ['auth', 'auth'],
 ];
 
 export function unenforcedFeatureWarnings(config: GatewayConfig): string[] {
