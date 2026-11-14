@@ -282,7 +282,8 @@ that are hard to trigger on purpose.
   and a clean exit 0 on SIGTERM.
 - The mock upstream (`mock/upstream.ts`) echoes requests and has endpoints for failure cases: slow,
   flaky, fixed status, dropped connection, truncated body and non-HTTP replies. `npm run mock` starts it
-  on the example config's ports.
+  on the example config's ports. Its `/flaky` endpoint has its own tests (`test/mock.test.ts`), since
+  the retry and circuit breaker tests depend on it counting exactly as documented.
 
 ## What I'd build next
 

@@ -83,11 +83,24 @@ the gateway forwarded. It also has endpoints for failure cases, under any path p
 | --- | --- |
 | `/status/<code>` | Responds with that HTTP status |
 | `/slow?ms=<n>` | Waits `n` ms, then echoes |
-| `/flaky?fail=<n>&key=<k>` | Returns 503 for the first `n` calls with that key (default `default`), then echoes |
+| `/flaky?fail=<n>&key=<k>` | Returns 503 for the first `n` calls with that key, then echoes (details below) |
 | `/healthz` | Health check endpoint, returns 200 |
 | `/reset` | Drops the connection without responding |
 | `/truncate` | Sends headers and part of the body, then drops the connection |
 | `/garbage` | Answers with bytes that aren't HTTP |
+
+**How `/flaky` counts.** The mock keeps a call counter for each `key`, and each call adds one:
+
+- Calls numbered up to `fail` get 503 `{"upstream":"...","error":"flaky","call":<n>}`; later calls echo
+  with 200. So `fail=2` gives 503, 503, 200, 200, …
+- Each `key` has its own counter, so `key=a` and `key=b` fail independently. Without `key`, the key
+  `default` is used. Without `fail`, it fails once; `fail=0` never fails.
+- The counter is per key only. The path before `/flaky` and the value of `fail` aren't part of it, and
+  `fail` is read on every call.
+- Counters live in memory and start over when the mock restarts.
+
+Tests give each case its own key, so they don't affect each other. These behaviors are tested in
+`test/mock.test.ts`.
 
 For example, this shows the 504 after the 30s global timeout:
 
@@ -167,6 +180,7 @@ Every implemented feature has tests for both what should work and what should fa
 | Rate limiting | Admits the limit; headers; windows reset; inherited global limit | 429 with `retry_after`; 50 simultaneous requests against a limit of 10; fake `X-Forwarded-For` ignored; per IP vs. global | `limiters`, `rateLimit` |
 | Auth | Every configured key; custom header name; key not forwarded | Missing, wrong, empty, partial, wrong-case and duplicate keys; `..` bypass attempt; failed guesses rate limited | `auth` |
 | Startup warnings | Silent for implemented features | Warns for each configured feature that isn't built yet | `features` |
+| Mock `/flaky` endpoint | Recovers after `fail` calls; echoes the request | Counters separate per key; defaults (`key=default`, `fail=1`, `fail=0`); counters reset on restart | `mock` |
 
 Files are in `test/` and named `<name>.test.ts`. Unit tests use a fake clock where time matters, so
 windows and cooldowns are tested without waiting. Integration tests talk to a real gateway over HTTP.

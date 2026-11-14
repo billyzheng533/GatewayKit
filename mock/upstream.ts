@@ -8,8 +8,12 @@ import type { AddressInfo } from 'node:net';
  *   GET  /healthz          200 {"status":"ok"}  (or 503 while `setHealthy(false)`)
  *   ANY  /status/<code>    responds with that status code
  *   ANY  /slow?ms=<n>      waits n milliseconds, then echoes
- *   ANY  /flaky?fail=<n>&key=<k>   fails with 503 for the first n calls with that key
- *                          (default key "default"), then echoes
+ *   ANY  /flaky?fail=<n>&key=<k>
+ *                          keeps a call counter per key: calls numbered up to n get
+ *                          503 {"upstream","error":"flaky","call"}, later ones echo.
+ *                          key defaults to "default", fail to 1 (fail=0 never fails).
+ *                          The counter is per key only (not per path or fail value)
+ *                          and starts over when the mock restarts.
  *   ANY  /reset            destroys the connection without responding
  *   ANY  /truncate         sends headers and part of the body, then destroys the connection
  *   ANY  /garbage          answers with bytes that aren't HTTP
