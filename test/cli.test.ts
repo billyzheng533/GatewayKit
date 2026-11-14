@@ -12,7 +12,14 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
  * to start on a bad config, and clean shutdown on SIGTERM.
  */
 
-const TSX = join(process.cwd(), 'node_modules', '.bin', 'tsx');
+/**
+ * Run the gateway with `node --import tsx` rather than the `tsx` launcher. The
+ * launcher starts the gateway as a child process, so killing the launcher can
+ * leave the gateway running (and ignoring SIGTERM, since it expects the
+ * launcher to relay signals). This way the process the test controls *is* the
+ * gateway: signals reach our own shutdown handler and SIGKILL really stops it.
+ */
+const NODE_ARGS = ['--import', 'tsx', 'src/index.ts'];
 let dir: string;
 const children: ChildProcess[] = [];
 
@@ -42,7 +49,7 @@ interface CliRun {
 }
 
 function runCli(args: string[], env: Record<string, string> = {}): CliRun {
-  const child = spawn(TSX, ['src/index.ts', ...args], { env: { ...process.env, ...env }, stdio: 'pipe' });
+  const child = spawn(process.execPath, [...NODE_ARGS, ...args], { env: { ...process.env, ...env }, stdio: 'pipe' });
   children.push(child);
   let out = '';
   let err = '';

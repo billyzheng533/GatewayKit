@@ -10,7 +10,14 @@ const MOCKS: Array<[name: string, port: number]> = [
   ['internal', 3006],
 ];
 
-const running = await Promise.all(MOCKS.map(([name, port]) => startMockUpstream(name, port)));
+// Log every request each mock receives, so you can watch the gateway's traffic and health checks arrive.
+const running = await Promise.all(
+  MOCKS.map(([name, port]) =>
+    startMockUpstream(name, port, {
+      onRequest: (line) => console.log(`${new Date().toISOString().slice(11, 19)} [${name}] ${line}`),
+    }),
+  ),
+);
 for (const mock of running) console.log(`mock upstream "${mock.name}" listening on ${mock.url}`);
 
 const stop = async () => {

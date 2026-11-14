@@ -264,9 +264,12 @@ The brief says ambiguities are intentional; these are the calls I made:
 | When is a target unhealthy, and when does it recover? | Unhealthy after `unhealthy_threshold` failed checks in a row; one success in between resets the count. Healthy again after a single passing check. The spec only defines the unhealthy side; recovering on one success gets a target back into service as soon as it's up. |
 | Check timeout | The route's upstream timeout or the check interval, whichever is shorter, so a hanging target can't stall its own checks. |
 | At startup | Targets start healthy and the first round of checks runs immediately, so traffic flows from the start and a dead target is found within `unhealthy_threshold` intervals. |
-| Every target unhealthy | 503 `{ "error": "no_healthy_upstream", ... }` right away, with no upstream call. Sending traffic to targets known to be down would only produce slow 502s. Some gateways "fail open" instead (send to all targets when none look healthy, in case the health endpoint itself is what's broken); that's a reasonable alternative I'd make configurable. |
+| Every target unhealthy | 503 `{ "error": "no_healthy_upstream", ... }` right away, with no upstream call (fail closed). Sending traffic to targets known to be down would only produce slow 502s. |
+| A `health_check.path` the service doesn't have | Every check fails, so about `interval × unhealthy_threshold` after startup the route answers 503. I considered failing open (sending traffic to all targets when none look healthy, as some gateways do) and decided against it: the config says to mark failing targets unhealthy, failing open turns a real outage into slow 502s and hides it, and it leaves broken health endpoints unfixed. Instead the failure is made obvious: the warning gives the reason, and a 404 or 405 adds a hint that the path is probably wrong (below). |
+| Why did a target go unhealthy? | The warning says: `reason: "status 404"`, `"connection refused"`, `"timed out after 5000ms"`, and so on. For a 404 or 405, which almost always mean a wrong path rather than a sick service, it adds `hint: ".../healthz returned 404: the target may not have a health endpoint at this path; check health_check.path"`. |
 | Overlapping checks | If a target's previous check is still running, the next one is skipped rather than piling up. |
 | Shutdown | Checks start only once the gateway is listening, and stop (including checks in flight) when it shuts down. Their timers never keep the process alive. |
+| How can you see them? | At startup the gateway logs which targets are checked, how often and the threshold. After that it logs only state changes (unhealthy, healthy again), not every passing check, so a healthy system stays quiet. `npm run mock` prints each request it receives, including the checks. |
 | Passive checks | Only active checks, as configured. Real request failures don't mark a target unhealthy (that's what the circuit breaker is for); see "What I'd build next". |
 
 ### Rate limiting
@@ -392,7 +395,10 @@ that are hard to trigger on purpose.
   must warn. `test/alternateConfig.test.ts` runs a second shipped config end to end.
 - **CLI tests** start the real `src/index.ts` as a separate process: config from an argument or
   `GATEWAY_CONFIG`, refusal to start on an invalid or missing config (exit 1), usage message (exit 2),
-  a clean exit 0 on SIGTERM, and a clear exit 1 when the port is already in use.
+  a clean exit 0 on SIGTERM, and a clear exit 1 when the port is already in use. They run the gateway
+  with `node --import tsx`, not the `tsx` launcher: the launcher starts the gateway as a child process,
+  so killing the launcher left the gateway running. That leaked one process per test run until I
+  noticed 25 leftover gateways while checking health checks by hand.
 - The mock upstream (`mock/upstream.ts`) echoes requests and has endpoints for failure cases: slow,
   flaky, fixed status, dropped connection, truncated body and non-HTTP replies. `npm run mock` starts it
   on the example config's ports. Its `/flaky` endpoint has its own tests (`test/mock.test.ts`), since

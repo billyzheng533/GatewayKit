@@ -34,8 +34,9 @@ GATEWAY_CONFIG=gateway.yaml npm start
 ```
 
 The gateway listens on `gateway.port` from the config (8080 in the example). It logs JSON lines: one per
-request to stdout, and warnings to stderr. Warnings at startup cover unknown config keys and configured
-features that aren't implemented yet; at runtime they cover retries, circuit breaker changes, upstream
+request to stdout, and warnings to stderr. At startup it also logs which targets are health-checked and
+how often. Warnings at startup cover unknown config keys and configured features that aren't implemented
+yet; at runtime they cover retries, circuit breaker changes, upstream
 failures and rejected malformed requests. Bodies, headers and query strings are never logged.
 
 If the config is malformed, the gateway refuses to start and lists every problem it found:
@@ -212,7 +213,17 @@ content-length: 79
 The `allow` header lists the methods the route accepts.
 
 The mock echoes each request back as JSON (method, path, query, headers, body), so you can see exactly what
-the gateway forwarded. It also has endpoints for failure cases, under any path prefix:
+the gateway forwarded. `npm run mock` also prints one line per request it receives, which is where you can
+watch the gateway's health checks arrive: `/api/products` checks both of its targets as soon as the
+gateway starts, then every 30 seconds:
+
+```text
+23:51:26 [products-a] GET /healthz -> 200
+23:51:26 [products-b] GET /healthz -> 200
+```
+
+Only routes with `health_check` are checked, so the other mocks only log the requests you send.
+ It also has endpoints for failure cases, under any path prefix:
 
 | Endpoint | Behavior |
 | --- | --- |
@@ -313,7 +324,7 @@ Every implemented feature has tests for both what should work and what should fa
 | Timeouts | Route and global timeouts | 504 for a slow or hanging upstream, without waiting for it | `gateway`, `failures` |
 | Retry | Recovers after failures; fixed and exponential timing; PUT retried with its body | Gives up after `attempts`; statuses not in `on` not retried; POST not duplicated; stops when the client disconnects | `resilience`, `resilienceFailures` |
 | Circuit breaker | Stays closed on success and 4xx; recovers through a half-open trial | Opens on 5xx, unreachable and timed-out upstreams; failed trial re-opens; 401s don't count | `circuitBreaker`, `resilience`, `resilienceFailures`, `failures`, `auth` |
-| Health checks | Checks the configured path on every target; a failing target is taken out of rotation after `unhealthy_threshold` checks and put back after one success | Down, failing and too-slow targets are skipped; 503 without any upstream call when no target is healthy; checks stop on shutdown; failure count resets on success | `healthCheck`, `healthCheckRouting` |
+| Health checks | Checks the configured path on every target; a failing target is taken out of rotation after `unhealthy_threshold` checks and put back after one success | Down, failing and too-slow targets are skipped; 503 without any upstream call when no target is healthy; each failure has a reason, and a 404/405 hints at a wrong `health_check.path`; checks stop on shutdown; failure count resets on success | `healthCheck`, `healthCheckRouting` |
 | Load balancing | Round robin; weighted 3:1 spread out (A, A, B, A); 40 simultaneous requests split exactly 30/10; `strip_prefix` on every target | A retried attempt moves to the next target; a dead target gives 502 only for its share; all targets down gives 502 | `balancer`, `loadBalancing` |
 | Rate limiting | Admits the limit; headers; windows reset; inherited global limit | 429 with `retry_after`; 50 simultaneous requests against a limit of 10; fake `X-Forwarded-For` ignored; per IP vs. global | `limiters`, `rateLimit` |
 | Auth | Every configured key; custom header name; key not forwarded | Missing, wrong, empty, partial, wrong-case and duplicate keys; `..` bypass attempt; failed guesses rate limited | `auth` |

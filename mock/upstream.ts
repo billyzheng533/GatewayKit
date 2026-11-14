@@ -42,7 +42,12 @@ export interface MockUpstream {
   close(): Promise<void>;
 }
 
-export async function startMockUpstream(name: string, port = 0): Promise<MockUpstream> {
+export interface MockOptions {
+  /** Called with one line per finished request, e.g. "GET /healthz -> 200". Off by default (tests stay quiet). */
+  onRequest?: (line: string) => void;
+}
+
+export async function startMockUpstream(name: string, port = 0, options: MockOptions = {}): Promise<MockUpstream> {
   const requests: RecordedRequest[] = [];
   let healthy = true;
   const flakyCalls = new Map<string, number>();
@@ -59,6 +64,7 @@ export async function startMockUpstream(name: string, port = 0): Promise<MockUps
       callerDisconnected: false,
     };
     requests.push(recorded);
+    res.on('finish', () => options.onRequest?.(`${recorded.method} ${recorded.url} -> ${res.statusCode}`));
     res.on('close', () => {
       if (!res.writableFinished) recorded.callerDisconnected = true;
     });

@@ -21,8 +21,11 @@ import type { Logger } from '../logger.js';
  *   never keep the process alive or delay shutdown.
  */
 
-/** Requests `url` and reports whether it answered with a 2xx in time. */
-export type Probe = (url: URL, timeoutMs: number, signal: AbortSignal) => Promise<boolean>;
+/** The outcome of one health check. A failure says why, so logs can explain it. */
+export type CheckResult = { ok: true } | { ok: false; reason: string; status?: number };
+
+/** Requests `url` and reports whether it answered with a 2xx in time, and if not, why. */
+export type Probe = (url: URL, timeoutMs: number, signal: AbortSignal) => Promise<CheckResult>;
 
 interface TargetState {
   healthy: boolean;
@@ -47,6 +50,12 @@ export class HealthChecker {
   }
 
   start(): void {
+    this.logger.info('health checks started', {
+      route: this.routePath,
+      targets: this.targets.map((t) => healthCheckUrl(t.url, this.config.path).href),
+      interval_ms: this.config.intervalMs,
+      unhealthy_threshold: this.config.unhealthyThreshold,
+    });
     void this.checkAll();
     this.timer = setInterval(() => void this.checkAll(), this.config.intervalMs);
     this.timer.unref();
@@ -64,11 +73,13 @@ export class HealthChecker {
     await Promise.all(this.targets.map((target) => this.checkOne(target)));
   }
 
-  /** Applies one check result to a target's state. */
-  record(target: UpstreamTarget, ok: boolean): void {
+  /** Applies one check result to a target's state. A bare boolean is accepted for convenience in tests. */
+  record(target: UpstreamTarget, outcome: CheckResult | boolean): void {
+    const result: CheckResult =
+      typeof outcome === 'boolean' ? (outcome ? { ok: true } : { ok: false, reason: 'failed' }) : outcome;
     const state = this.states.get(target);
     if (!state) return;
-    if (ok) {
+    if (result.ok) {
       state.consecutiveFailures = 0;
       if (!state.healthy) {
         state.healthy = true;
@@ -83,6 +94,8 @@ export class HealthChecker {
         route: this.routePath,
         target: target.url.origin,
         consecutive_failures: state.consecutiveFailures,
+        reason: result.reason,
+        ...hintFor(result, healthCheckUrl(target.url, this.config.path)),
       });
     }
   }
@@ -92,8 +105,8 @@ export class HealthChecker {
     if (!state || state.checking || this.abort.signal.aborted) return;
     state.checking = true;
     try {
-      const ok = await this.probe(healthCheckUrl(target.url, this.config.path), this.checkTimeoutMs, this.abort.signal);
-      if (!this.abort.signal.aborted) this.record(target, ok);
+      const result = await this.probe(healthCheckUrl(target.url, this.config.path), this.checkTimeoutMs, this.abort.signal);
+      if (!this.abort.signal.aborted) this.record(target, result);
     } finally {
       state.checking = false;
     }
@@ -108,15 +121,33 @@ export function healthCheckUrl(target: URL, path: string): URL {
   return url;
 }
 
+/**
+ * A 404 or 405 from the health check path almost always means the path is
+ * wrong (or the service has no health endpoint), not that the service is
+ * sick. Say so, since otherwise this looks like an outage.
+ */
+function hintFor(result: CheckResult, url: URL): { hint?: string } {
+  if (result.ok || (result.status !== 404 && result.status !== 405)) return {};
+  return {
+    hint: `${url.href} returned ${result.status}: the target may not have a health endpoint at this path; check health_check.path`,
+  };
+}
+
 export const httpProbe: Probe = (url, timeoutMs, signal) =>
   new Promise((resolve) => {
+    const timeout = AbortSignal.timeout(timeoutMs);
     const req = (url.protocol === 'https:' ? https : http).get(
       url,
-      { signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]), agent: false },
+      { signal: AbortSignal.any([signal, timeout]), agent: false },
       (res) => {
         res.resume();
-        resolve((res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300);
+        const status = res.statusCode ?? 0;
+        resolve(status >= 200 && status < 300 ? { ok: true } : { ok: false, reason: `status ${status}`, status });
       },
     );
-    req.on('error', () => resolve(false));
+    req.on('error', (err: NodeJS.ErrnoException) => {
+      if (timeout.aborted) resolve({ ok: false, reason: `timed out after ${timeoutMs}ms` });
+      else if (err.code === 'ECONNREFUSED') resolve({ ok: false, reason: 'connection refused' });
+      else resolve({ ok: false, reason: err.code ?? err.message ?? 'request failed' });
+    });
   });

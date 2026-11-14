@@ -46,12 +46,41 @@ describe('HealthChecker state', () => {
     expect(lines).toEqual(['warn upstream target unhealthy', 'info upstream target healthy again']);
   });
 
+  it('says why a target became unhealthy', () => {
+    const logged: Array<Record<string, unknown>> = [];
+    const logger: Logger = { info: () => {}, warn: (_m, fields = {}) => logged.push(fields), error: () => {} };
+    const checker = make(logger);
+    for (let i = 0; i < 3; i += 1) checker.record(a, { ok: false, reason: 'connection refused' });
+    expect(logged).toEqual([
+      { route: '/r', target: 'http://a', consecutive_failures: 3, reason: 'connection refused' },
+    ]);
+  });
+
+  it.each([404, 405])('adds a hint to check health_check.path when the check gets %i', (status) => {
+    const logged: Array<Record<string, unknown>> = [];
+    const logger: Logger = { info: () => {}, warn: (_m, fields = {}) => logged.push(fields), error: () => {} };
+    const checker = make(logger);
+    for (let i = 0; i < 3; i += 1) checker.record(a, { ok: false, reason: `status ${status}`, status });
+    expect(logged[0]).toMatchObject({
+      reason: `status ${status}`,
+      hint: `http://a/healthz returned ${status}: the target may not have a health endpoint at this path; check health_check.path`,
+    });
+  });
+
+  it('gives no path hint for failures that point to a sick service', () => {
+    const logged: Array<Record<string, unknown>> = [];
+    const logger: Logger = { info: () => {}, warn: (_m, fields = {}) => logged.push(fields), error: () => {} };
+    const checker = make(logger);
+    for (let i = 0; i < 3; i += 1) checker.record(a, { ok: false, reason: 'status 503', status: 503 });
+    expect(logged[0]).not.toHaveProperty('hint');
+  });
+
   it('skips a target whose previous check is still running', async () => {
     let calls = 0;
     let release!: () => void;
     const slowProbe: Probe = () => {
       calls += 1;
-      return new Promise((resolve) => (release = () => resolve(true)));
+      return new Promise((resolve) => (release = () => resolve({ ok: true })));
     };
     const checker = new HealthChecker('/r', [a], config, 1_000, silentLogger, slowProbe);
     const first = checker.checkAll();
@@ -63,7 +92,7 @@ describe('HealthChecker state', () => {
 
   it('ignores results that arrive after stop()', async () => {
     let release!: () => void;
-    const probe: Probe = () => new Promise((resolve) => (release = () => resolve(false)));
+    const probe: Probe = () => new Promise((resolve) => (release = () => resolve({ ok: false, reason: 'status 503', status: 503 })));
     const checker = new HealthChecker('/r', [a], { ...config, unhealthyThreshold: 1 }, 1_000, silentLogger, probe);
     const pending = checker.checkAll();
     checker.stop();
@@ -95,26 +124,40 @@ describe('httpProbe', () => {
   });
 
   it('passes on a 2xx', async () => {
-    expect(await httpProbe(new URL(`${mock.url}/healthz`), 500, never)).toBe(true);
+    expect(await httpProbe(new URL(`${mock.url}/healthz`), 500, never)).toEqual({ ok: true });
   });
 
-  it('fails on a non-2xx status', async () => {
+  it('fails on a non-2xx status, reporting the status', async () => {
     mock.setHealthy(false);
     try {
-      expect(await httpProbe(new URL(`${mock.url}/healthz`), 500, never)).toBe(false);
-      expect(await httpProbe(new URL(`${mock.url}/status/301`), 500, never)).toBe(false);
+      expect(await httpProbe(new URL(`${mock.url}/healthz`), 500, never)).toEqual({
+        ok: false,
+        reason: 'status 503',
+        status: 503,
+      });
+      expect(await httpProbe(new URL(`${mock.url}/status/404`), 500, never)).toEqual({
+        ok: false,
+        reason: 'status 404',
+        status: 404,
+      });
     } finally {
       mock.setHealthy(true);
     }
   });
 
   it('fails when the target refuses the connection', async () => {
-    expect(await httpProbe(new URL(`http://127.0.0.1:${deadPort}/healthz`), 500, never)).toBe(false);
+    expect(await httpProbe(new URL(`http://127.0.0.1:${deadPort}/healthz`), 500, never)).toEqual({
+      ok: false,
+      reason: 'connection refused',
+    });
   });
 
   it('fails when the target answers too slowly', async () => {
     const started = Date.now();
-    expect(await httpProbe(new URL(`${mock.url}/slow?ms=1000`), 100, never)).toBe(false);
+    expect(await httpProbe(new URL(`${mock.url}/slow?ms=1000`), 100, never)).toEqual({
+      ok: false,
+      reason: 'timed out after 100ms',
+    });
     expect(Date.now() - started).toBeLessThan(500);
   });
 });
