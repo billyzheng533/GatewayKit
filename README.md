@@ -60,19 +60,19 @@ npm start -- gateway.yaml
 ```
 
 ```bash
-curl -i localhost:8080/health
+curl -i "localhost:8080/health"
 ```
 
 ```bash
-curl -i localhost:8080/api/users/42?expand=orders
+curl -i "localhost:8080/api/users/42?expand=orders"
 ```
 
 ```bash
-curl -i localhost:8080/api/products/123
+curl -i "localhost:8080/api/products/123"
 ```
 
 ```bash
-curl -i -X POST localhost:8080/api/products
+curl -i -X POST "localhost:8080/api/products"
 ```
 
 The mock echoes each request back as JSON (method, path, query, headers, body), so you can see exactly what
@@ -88,7 +88,14 @@ the gateway forwarded. It also has endpoints for failure cases, under any path p
 | `/truncate` | Sends headers and part of the body, then drops the connection |
 | `/garbage` | Answers with bytes that aren't HTTP |
 
-For example, `curl -i localhost:8080/api/users/slow?ms=40000` shows the 504 after the 30s global timeout.
+For example, this shows the 504 after the 30s global timeout:
+
+```bash
+curl -i "localhost:8080/api/users/slow?ms=40000"
+```
+
+URLs are quoted throughout: in zsh (the macOS default shell), an unquoted `?` is a filename wildcard and
+the command fails with `no matches found`.
 
 **Retry:** `/api/orders` retries 503s with exponential backoff (1s, then 2s). This fails twice, then
 succeeds about 3 seconds later; the gateway's log shows each retry:
@@ -98,27 +105,29 @@ curl -i "localhost:8080/api/orders/flaky?fail=2&key=demo"
 ```
 
 **Circuit breaker:** `/api/internal` opens after 5 failures within 60s. Send 5 failing requests, and the
-6th is rejected with 503 `{"error":"service_unavailable","retry_after":30}` without reaching the upstream:
+6th is rejected with 503 `{"error":"service_unavailable","retry_after":30}` without reaching the upstream.
+The route also requires an API key, so the requests send one:
 
 ```bash
-for i in 1 2 3 4 5 6; do curl -s localhost:8080/api/internal/status/500; echo; done
+for i in 1 2 3 4 5 6; do curl -s -H 'X-API-Key: sk_live_abc123' "localhost:8080/api/internal/status/500"; echo; done
 ```
 
 **Auth:** `/api/internal` needs one of the configured keys in `X-API-Key`. Without one you get 401:
 
 ```bash
-curl -i localhost:8080/api/internal/stats
+curl -i "localhost:8080/api/internal/stats"
 ```
 
 ```bash
-curl -i -H 'X-API-Key: sk_live_abc123' localhost:8080/api/internal/stats
+curl -i -H 'X-API-Key: sk_live_abc123' "localhost:8080/api/internal/stats"
 ```
 
 **Rate limiting:** `/api/orders` allows 10 requests per 10 seconds per client. The 11th and 12th get 429
-with `{"error":"rate_limited",...,"retry_after":10}`, and every response carries `X-RateLimit-*` headers:
+with `{"error":"rate_limited",...,"retry_after":10}`, and every response carries `X-RateLimit-*` headers.
+If you ran the retry example in the last 10 seconds, it used one of the 10, so the 10th gets 429 too:
 
 ```bash
-for i in $(seq 1 12); do curl -s -o /dev/null -w '%{http_code} ' localhost:8080/api/orders/$i; done; echo
+for i in $(seq 1 12); do curl -s -o /dev/null -w '%{http_code} ' "localhost:8080/api/orders/$i"; done; echo
 ```
 
 ## Running the tests
