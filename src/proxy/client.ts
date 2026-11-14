@@ -74,7 +74,10 @@ export class UpstreamClient {
         upstreamReq.destroy();
       }, timeoutMs);
 
-      upstreamReq.on('error', (err) => fail(new UpstreamUnavailableError(targetLabel, describeConnectError(err))));
+      upstreamReq.on('error', (err) => {
+        const { error, code } = describeConnectError(err);
+        fail(new UpstreamUnavailableError(targetLabel, error, code));
+      });
       upstreamReq.end(request.body);
     });
   }
@@ -90,10 +93,12 @@ export class UpstreamClient {
  * Node reports an AggregateError whose message is empty. Surface the error
  * code (e.g. ECONNREFUSED) so logs and 502 bodies say what actually happened.
  */
-function describeConnectError(err: Error): Error {
+function describeConnectError(err: Error): { error: Error; code?: string } {
   const inner = err instanceof AggregateError && err.errors[0] instanceof Error ? err.errors[0] : err;
   const code = (err as NodeJS.ErrnoException).code ?? (inner as NodeJS.ErrnoException).code;
   const message = err.message || inner.message;
-  if (code && message) return new Error(message.includes(code) ? message : `${code}: ${message}`, { cause: err });
-  return new Error(code ?? message ?? 'connection failed', { cause: err });
+  if (code && message) {
+    return { error: new Error(message.includes(code) ? message : `${code}: ${message}`, { cause: err }), code };
+  }
+  return { error: new Error(code ?? message ?? 'connection failed', { cause: err }), code };
 }

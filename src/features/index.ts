@@ -1,6 +1,8 @@
 import type { GatewayConfig, RouteConfig } from '../config/types.js';
 import type { Logger } from '../logger.js';
 import type { Middleware } from '../pipeline.js';
+import { circuitBreakerFeature } from './circuitBreaker/index.js';
+import { retryFeature } from './retry/index.js';
 
 /**
  * Feature registry: the extension point for config features.
@@ -18,6 +20,8 @@ import type { Middleware } from '../pipeline.js';
  */
 export interface FeatureDeps {
   logger: Logger;
+  /** Current time in ms. Injected so time-based features can be tested without real waiting. */
+  now: () => number;
 }
 
 export interface Feature {
@@ -25,7 +29,13 @@ export interface Feature {
   create(route: RouteConfig, deps: FeatureDeps): Middleware | null;
 }
 
-export const FEATURES: readonly Feature[] = [];
+/**
+ * Pipeline order, outermost first:
+ *   retry            wraps the breaker, so each attempt is counted separately
+ *                    and retrying stops once the breaker opens
+ *   circuit_breaker  innermost, closest to the upstream call
+ */
+export const FEATURES: readonly Feature[] = [retryFeature, circuitBreakerFeature];
 
 export function buildRouteMiddleware(route: RouteConfig, deps: FeatureDeps): Middleware[] {
   return FEATURES.map((feature) => feature.create(route, deps)).filter((mw): mw is Middleware => mw !== null);
@@ -37,12 +47,10 @@ export function buildRouteMiddleware(route: RouteConfig, deps: FeatureDeps): Mid
  */
 const NOT_YET_ENFORCED: Array<[keyof RouteConfig, string]> = [
   ['rateLimit', 'rate_limit / global_rate_limit'],
-  ['retry', 'retry'],
   ['healthCheck', 'health_check'],
   ['requestTransform', 'request_transform'],
   ['responseTransform', 'response_transform'],
   ['auth', 'auth'],
-  ['circuitBreaker', 'circuit_breaker'],
 ];
 
 export function unenforcedFeatureWarnings(config: GatewayConfig): string[] {

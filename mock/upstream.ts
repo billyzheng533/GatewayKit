@@ -8,7 +8,8 @@ import type { AddressInfo } from 'node:net';
  *   GET  /healthz          200 {"status":"ok"}  (or 503 while `setHealthy(false)`)
  *   ANY  /status/<code>    responds with that status code
  *   ANY  /slow?ms=<n>      waits n milliseconds, then echoes
- *   ANY  /flaky?fail=<n>   fails with 503 for the first n calls (per instance), then echoes
+ *   ANY  /flaky?fail=<n>&key=<k>   fails with 503 for the first n calls with that key
+ *                          (default key "default"), then echoes
  *   ANY  anything else     echoes the request back as JSON
  *
  * Every response carries `Server` and `X-Powered-By` headers (so header removal
@@ -35,7 +36,7 @@ export interface MockUpstream {
 export async function startMockUpstream(name: string, port = 0): Promise<MockUpstream> {
   const requests: RecordedRequest[] = [];
   let healthy = true;
-  let flakyCalls = 0;
+  const flakyCalls = new Map<string, number>();
 
   const server = http.createServer(async (req, res) => {
     const chunks: Buffer[] = [];
@@ -76,9 +77,11 @@ export async function startMockUpstream(name: string, port = 0): Promise<MockUps
       return;
     }
     if (last === 'flaky') {
-      flakyCalls += 1;
+      const key = url.searchParams.get('key') ?? 'default';
+      const call = (flakyCalls.get(key) ?? 0) + 1;
+      flakyCalls.set(key, call);
       const failures = Number(url.searchParams.get('fail') ?? 1);
-      if (flakyCalls <= failures) return json(503, { upstream: name, error: 'flaky', call: flakyCalls });
+      if (call <= failures) return json(503, { upstream: name, error: 'flaky', call });
       return echo();
     }
     return echo();

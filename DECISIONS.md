@@ -125,19 +125,30 @@ The brief says ambiguities are intentional; these are the calls I made:
 | Does `methods: ["GET"]` allow HEAD? | No. Only the listed methods are allowed; the 405 response lists them in `Allow`. |
 | What does the timeout cover? | Time until the upstream sends response headers. After that the body streams until it finishes or the client disconnects. A slow body can't change the status code anyway, since headers are already sent. |
 | Unreachable upstream vs. slow upstream | 502 `bad_gateway` vs. 504 `gateway_timeout`. Upstream 4xx/5xx responses pass through unchanged. |
-| Error response shape | All gateway-generated errors are JSON `{ "error": "<code>", "message": "..." }`, matching the circuit breaker's `{ "error": "service_unavailable", ... }` in the spec. |
+| Error response shape | All gateway-generated errors are JSON `{ "error": "<code>", "message": "..." }`. The one exception is the open circuit breaker, which returns exactly the body the spec gives: `{ "error": "service_unavailable", "retry_after": <seconds> }`. |
 | Which client IP is used? | The socket's remote address. `X-Forwarded-For` from the client is passed along but **not** trusted for identifying the client, since a client could set it to dodge per-IP rate limits. Behind a trusted load balancer this would become a config option. |
 | Is `gateway.port` used? | Yes; it defaults to 8080 if missing. |
 | Unknown config keys | Warning, gateway still starts. Invalid values for known keys: startup fails. |
 
+### Retry and circuit breaker
+
+| Question | Decision |
+| --- | --- |
+| What does `attempts: 3` mean? | 3 tries in total: the first request plus 2 retries. |
+| How long between retries? | Before retry *n*: `initial_delay` (fixed) or `initial_delay * 2^(n-1)` (exponential). The example's `1s` exponential waits 1s, then 2s. |
+| What triggers a retry? | An upstream status listed in `on`, or no response at all: unreachable counts as 502 and timed out as 504, so `on: [502, 503, 504]` covers both. Each attempt gets the route's full timeout. |
+| Retry a POST? | Only if the request provably never reached the upstream (connection refused, DNS failure). A POST that got a 503 might already have created an order, and a retry could create a second one. GET, HEAD, OPTIONS, PUT and DELETE are idempotent and are always retried. |
+| What counts as a breaker failure? | Unreachable, timed out, or any 5xx from the upstream. 4xx is the client's fault and counts as a success. |
+| How is `window` counted? | A sliding window: the breaker opens when `threshold` failures happened within the last `window`. Successes don't reset the count. |
+| What happens after `cooldown`? | Half-open: exactly one trial request goes through. Success closes the breaker; failure re-opens it for another full cooldown. Other requests are rejected while the trial is in flight. |
+| `retry_after` value | Seconds left in the cooldown, rounded up (at least 1). Also sent as a `Retry-After` header. |
+| Breaker per route or per target? | Per route, since that's where the config lives. With load balancing it should become per target, so one bad target doesn't block healthy ones. |
+| Retry and breaker on the same route | Retry wraps the breaker. Each attempt counts as a separate breaker result, and once the breaker opens mid-retry, the remaining attempts stop instead of hammering a failing upstream. A breaker rejection is never retried. |
+
 Planned calls for features not built yet (to be confirmed as they're implemented):
 
-- `retry.attempts: 3` means 3 attempts in total (the first try plus 2 retries). Backoff for attempt
-  *n* is `initial_delay` (fixed) or `initial_delay * 2^(n-1)` (exponential).
 - `global_rate_limit` inherited by a route gets that route's own counters; it isn't one budget shared
   across all routes.
-- Retries count against the route timeout per attempt, and only retry on the configured status codes
-  plus connection errors/timeouts.
 
 ## Current state
 
@@ -150,22 +161,28 @@ Planned calls for features not built yet (to be confirmed as they're implemented
    404/405, proxying, `strip_prefix` and timeouts. Besides the automated tests, I ran the real gateway
    with the example `gateway.yaml` against the mock servers (`npm run mock`) and checked each behavior
    with `curl`.
+3. **Retry and circuit breaker.** I drafted rate limiting next, then pulled the resilience features
+   ahead of finishing it: "what happens when an upstream is down?" is the failure mode the gateway
+   exists to handle. Verified against the mock's flaky, slow and failing endpoints, and with the example
+   config (`/api/orders` retries after 1s and 2s; `/api/internal` opens after 5 failures).
 
 **Done and tested:** config loading and validation of the full schema, `/health`, routing, 404, 405,
 proxying (headers, body, query string, streaming), `strip_prefix`, per-route and global timeouts, 502/504
-handling, request IDs, access logs, graceful shutdown.
+handling, request IDs, access logs, graceful shutdown, retry with fixed/exponential backoff, circuit
+breaker.
 
-**Parsed and validated but not enforced yet:** rate limiting, retry, auth, circuit breaker, load
-balancing (all traffic goes to the first target), health checks, request/response transforms. The
-gateway logs a startup warning for each.
+**Parsed and validated but not enforced yet:** rate limiting (in progress), auth, load balancing (all traffic goes to the first
+target), health checks, request/response transforms. The gateway logs a startup warning for each.
 
 ## Testing approach
 
 - **Unit tests** for pure logic: duration parsing, path matching and rewriting, config validation
-  (including the exact error messages for malformed configs).
+  (including the exact error messages for malformed configs), and the circuit breaker's state machine
+  with a fake clock, so cooldowns and windows are tested without waiting.
 - **Integration tests** that start real mock upstreams and a real gateway on random ports and talk
-  to them over HTTP. They cover the non-negotiables, header forwarding, 502/504, and 50 concurrent
-  requests. They build configs through the same YAML loader as production and use different routes,
+  to them over HTTP. They cover the non-negotiables, header forwarding, 502/504, 50 concurrent
+  requests, retry (recovery, giving up, timeouts, backoff timing, no POST duplication) and the circuit
+  breaker opening, rejecting without calling the upstream, and recovering. They build configs through the same YAML loader as production and use different routes,
   ports and timeouts than `gateway.yaml`, which also exercises "works with any valid config".
 - The mock upstream (`mock/upstream.ts`) echoes requests and has slow, flaky and fixed-status
   endpoints for failure cases. `npm run mock` starts it on the example config's ports.

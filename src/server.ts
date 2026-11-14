@@ -20,6 +20,8 @@ export interface GatewayOptions {
   /** Overrides config.gateway.port (tests use 0 for a random free port). */
   port?: number;
   host?: string;
+  /** Clock for time-based features (rate limits, circuit breakers). Defaults to Date.now. */
+  now?: () => number;
 }
 
 export interface RunningGateway {
@@ -44,7 +46,10 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
     config.routes.map((route) => ({
       path: route.path,
       config: route,
-      handler: compose(buildRouteMiddleware(route, { logger }), createUpstreamHandler(route, client)),
+      handler: compose(
+        buildRouteMiddleware(route, { logger, now: options.now ?? Date.now }),
+        createUpstreamHandler(route, client),
+      ),
     })),
   );
 
