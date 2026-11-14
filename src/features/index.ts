@@ -2,6 +2,7 @@ import type { GatewayConfig, RouteConfig } from '../config/types.js';
 import type { Logger } from '../logger.js';
 import type { Middleware } from '../pipeline.js';
 import { circuitBreakerFeature } from './circuitBreaker/index.js';
+import { rateLimitFeature } from './rateLimit/index.js';
 import { retryFeature } from './retry/index.js';
 
 /**
@@ -31,11 +32,12 @@ export interface Feature {
 
 /**
  * Pipeline order, outermost first:
+ *   rate_limit       reject over-limit clients before doing any work
  *   retry            wraps the breaker, so each attempt is counted separately
  *                    and retrying stops once the breaker opens
  *   circuit_breaker  innermost, closest to the upstream call
  */
-export const FEATURES: readonly Feature[] = [retryFeature, circuitBreakerFeature];
+export const FEATURES: readonly Feature[] = [rateLimitFeature, retryFeature, circuitBreakerFeature];
 
 export function buildRouteMiddleware(route: RouteConfig, deps: FeatureDeps): Middleware[] {
   return FEATURES.map((feature) => feature.create(route, deps)).filter((mw): mw is Middleware => mw !== null);
@@ -46,7 +48,6 @@ export function buildRouteMiddleware(route: RouteConfig, deps: FeatureDeps): Mid
  * startup so nobody assumes, say, auth is on when it isn't.
  */
 const NOT_YET_ENFORCED: Array<[keyof RouteConfig, string]> = [
-  ['rateLimit', 'rate_limit / global_rate_limit'],
   ['healthCheck', 'health_check'],
   ['requestTransform', 'request_transform'],
   ['responseTransform', 'response_transform'],

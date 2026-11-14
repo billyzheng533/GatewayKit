@@ -104,6 +104,13 @@ curl -i "localhost:8080/api/orders/flaky?fail=2&key=demo"
 for i in 1 2 3 4 5 6; do curl -s localhost:8080/api/internal/status/500; echo; done
 ```
 
+**Rate limiting:** `/api/orders` allows 10 requests per 10 seconds per client. The 11th and 12th get 429
+with `{"error":"rate_limited",...,"retry_after":10}`, and every response carries `X-RateLimit-*` headers:
+
+```bash
+for i in $(seq 1 12); do curl -s -o /dev/null -w '%{http_code} ' localhost:8080/api/orders/$i; done; echo
+```
+
 ## Running the tests
 
 After `npm install`, the whole suite runs with one command:
@@ -125,9 +132,11 @@ Type-check with `npm run typecheck`, or re-run tests on every change with `npm r
 | `test/duration.test.ts` | Unit | Duration strings (`"500ms"`, `"30s"`, ...) and invalid ones |
 | `test/router.test.ts` | Unit | Prefix matching, most-specific-route wins, path rewriting |
 | `test/circuitBreaker.test.ts` | Unit | Breaker state machine with a fake clock: opening, cooldown, half-open trial |
+| `test/limiters.test.ts` | Unit | Fixed and sliding window algorithms with a fake clock |
 | `test/gateway.test.ts` | Integration | `/health`, proxying, 404, 405, headers, 502, 504, 413, 50 concurrent requests |
 | `test/stripPrefix.test.ts` | Integration | Exactly which path and query string the upstream receives |
 | `test/resilience.test.ts` | Integration | Retry (recovery, giving up, backoff, no duplicate POSTs) and circuit breaker |
+| `test/rateLimit.test.ts` | Integration | 429s and headers, 50 simultaneous requests, window resets, per IP vs. global, inherited limits |
 | `test/failures.test.ts` | Integration | Upstreams that reset, send garbage, die mid-response, hang, or restart; clients that disconnect |
 | `test/cli.test.ts` | Integration | Starting the real gateway: config from an argument or `GATEWAY_CONFIG`, bad config exits 1, SIGTERM exits 0 |
 
@@ -144,7 +153,7 @@ Type-check with `npm run typecheck`, or re-run tests on every change with `npm r
 | Proxying (method, path, query, headers, body; streamed responses) | ✅ |
 | `strip_prefix` | ✅ |
 | `global_timeout` / `upstream.timeout` (504 on timeout, 502 when unreachable) | ✅ |
-| `global_rate_limit` / `rate_limit` (`fixed_window`, `sliding_window`, `per: ip / global`) | ⏳ parsed, not enforced |
+| `global_rate_limit` / `rate_limit` (`fixed_window`, `sliding_window`, `per: ip / global`) | ✅ |
 | `retry` (`fixed` / `exponential` backoff, `on` status codes; POST only retried if never sent) | ✅ |
 | `auth` (`api_key`) | ⏳ parsed, not enforced |
 | `circuit_breaker` (`threshold` in `window`, `cooldown`, half-open trial, 503 with `retry_after`) | ✅ |

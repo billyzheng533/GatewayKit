@@ -148,10 +148,20 @@ The brief says ambiguities are intentional; these are the calls I made:
 | Breaker per route or per target? | Per route, since that's where the config lives. With load balancing it should become per target, so one bad target doesn't block healthy ones. |
 | Retry and breaker on the same route | Retry wraps the breaker. Each attempt counts as a separate breaker result, and once the breaker opens mid-retry, the remaining attempts stop instead of hammering a failing upstream. A breaker rejection is never retried. |
 
-Planned calls for features not built yet (to be confirmed as they're implemented):
+### Rate limiting
 
-- `global_rate_limit` inherited by a route gets that route's own counters; it isn't one budget shared
-  across all routes.
+| Question | Decision |
+| --- | --- |
+| Does a route without `rate_limit` share one global budget with other routes? | No. It inherits `global_rate_limit`'s *settings* but gets its own counters, so a busy route can't use up another route's budget. |
+| `fixed_window` | Each client's window starts at its first request and admits `requests` until it ends. O(1) memory per client. Known trade-off: up to 2x the limit in a burst straddling a window boundary (there's a test that pins this down). |
+| `sliding_window` | A sliding log: the timestamps of admitted requests in the last `window`. Exact, with no boundary burst. Memory is at most `requests` timestamps per client, fine for the limits a gateway config uses; very large limits would call for a sliding window *counter* instead. |
+| `per: "ip"` vs `"global"` | Per client socket address, or one budget shared by every client on that route. `X-Forwarded-For` is ignored for this, so a client can't dodge its limit by making up addresses. |
+| Do rejected requests count? | No. Only admitted requests use up budget, so a client hammering away while blocked recovers on schedule. Requests refused with 404 or 405 don't count either; rate limiting runs after routing and method checks. |
+| What does a client see? | 429 `{ "error": "rate_limited", "message": "...", "retry_after": <seconds> }` with a `Retry-After` header. Every response on a rate-limited route carries `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset` (seconds until the budget is full again). |
+| 50 simultaneous requests | Exactly `requests` get through. Each check-and-increment is synchronous on Node's single thread, so concurrent requests can't race on a counter. There's a test for exactly this. |
+| Memory for many clients | Idle clients' counters are swept once per window, so memory tracks active clients rather than every client ever seen. |
+| Where in the pipeline? | Outermost, before retry and the breaker: rejecting an over-limit client is the cheapest thing the gateway can do. Auth will go in front of it. |
+| Running several gateway instances | Limits are per instance (in memory). A shared store like Redis would be needed for a cluster-wide limit. |
 
 ## Current state
 
@@ -168,20 +178,30 @@ Planned calls for features not built yet (to be confirmed as they're implemented
    ahead of finishing it: "what happens when an upstream is down?" is the failure mode the gateway
    exists to handle. Verified against the mock's flaky, slow and failing endpoints, and with the example
    config (`/api/orders` retries after 1s and 2s; `/api/internal` opens after 5 failures).
+4. **Failure-mode tests.** Before adding more features, I added tests for how things break: upstreams
+   that reset, send non-HTTP bytes, die mid-response, hang or restart, and clients that disconnect.
+   Writing them exposed a real bug (oversized uploads got a broken pipe instead of a 413), now fixed.
+5. **Rate limiting finished.** Tests for both algorithms with a fake clock, then end to end, including
+   50 simultaneous requests against a limit of 10. Checked with the example config: `/api/orders` lets
+   exactly 10 requests through per 10 seconds.
 
 **Done and tested:** config loading and validation of the full schema, `/health`, routing, 404, 405,
 proxying (headers, body, query string, streaming), `strip_prefix`, per-route and global timeouts, 502/504
 handling, request IDs, access logs, graceful shutdown, retry with fixed/exponential backoff, circuit
-breaker.
+breaker, rate limiting (fixed and sliding window, per IP or global).
 
-**Parsed and validated but not enforced yet:** rate limiting (in progress), auth, load balancing (all traffic goes to the first
+**Parsed and validated but not enforced yet:** auth, load balancing (all traffic goes to the first
 target), health checks, request/response transforms. The gateway logs a startup warning for each.
 
 ## Testing approach
 
 - **Unit tests** for pure logic: duration parsing, path matching and rewriting, config validation
   (including the exact error messages for malformed configs), and the circuit breaker's state machine
-  with a fake clock, so cooldowns and windows are tested without waiting.
+  and both rate limiting algorithms with a fake clock, so cooldowns and windows are tested without
+  waiting.
+- **Rate limiting end to end** (`test/rateLimit.test.ts`): 429s, headers, 50 simultaneous requests,
+  window resets, inherited global limits. To get two client IPs from one machine, the per-IP and
+  global tests connect over both IPv4 (127.0.0.1) and IPv6 (::1).
 - **Integration tests** that start real mock upstreams and a real gateway on random ports and talk
   to them over HTTP. They cover the non-negotiables, header forwarding, 502/504, 50 concurrent
   requests, retry (recovery, giving up, timeouts, backoff timing, no POST duplication) and the circuit
