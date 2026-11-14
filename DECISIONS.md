@@ -3,6 +3,16 @@
 This document explains what I built, in what order, and why. It's kept up to date as features land; the
 commit history shows the same story step by step.
 
+Where to find what:
+
+| Topic | Section |
+| --- | --- |
+| How I prioritized which config features to implement | [How I prioritized](#how-i-prioritized) |
+| Architectural choices and trade-offs | [Architecture choices and trade-offs](#architecture-choices-and-trade-offs), [Security](#security), and the per-feature decision tables |
+| What I'd build next with more time | [What I'd build next](#what-id-build-next) |
+| Features partially implemented, and their current state | [Current state](#current-state) |
+| How I used AI tools | [How I used AI tools](#how-i-used-ai-tools) |
+
 ## Language: TypeScript on Node.js
 
 - I'm strongest in TypeScript, and the brief says to use what you're strongest in.
@@ -21,8 +31,12 @@ plugin for development.
 
 ## How I prioritized
 
-The evaluation runs the gateway against the example config and then against a different config with the
-same schema. So the order is:
+Two things drove the order. First, the evaluation runs the gateway against the example config and then
+against a different config with the same schema, so correctness for *any* config came before breadth.
+Second, **security is a top concern**: a gateway is the front door to every service behind it, so a hole
+in it is a hole in all of them. Whenever I found a security gap, fixing it jumped ahead of new features.
+
+The order:
 
 1. **Config loading and validation of the whole schema.** Every feature reads config, and "works with
    any valid config" plus "what happens when config is malformed?" both depend on this being solid.
@@ -33,17 +47,26 @@ same schema. So the order is:
    depends on. A gateway that gets these wrong is unusable regardless of what else it does.
 3. **An extensible pipeline**, so each later feature is a self-contained module rather than edits
    scattered across the server.
-4. **Then features, ordered by production value per hour of work.** This was the plan; the actual order
-   changed as I went, and the build log under "Current state" says what happened and why:
-   1. Rate limiting: protects upstreams, is configured on almost every route (via
-      `global_rate_limit`), and is where the "50 simultaneous requests" concurrency question lives.
-   2. Retry and circuit breaker: the resilience story ("what happens when an upstream is down?").
-   3. API key auth: small, and an unenforced auth setting is a security problem.
-   4. Load balancing with health checks.
-   5. Request/response transforms: the most surface area and the most ambiguity in the spec, and the
-      least about the gateway's core behavior.
+4. **Then features, ordered by production value per hour of work.** The plan was rate limiting, then
+   retry and circuit breaker, auth, load balancing with health checks, and transforms last. What I
+   actually did, and why it differed:
+   1. **Retry and circuit breaker** first: "what happens when an upstream is down?" is the failure
+      mode a gateway exists to handle, so I pulled it ahead of finishing rate limiting.
+   2. **Failure-mode tests** before more features, which found a real bug.
+   3. **Rate limiting**: configured on every route of the example (via `global_rate_limit`), and
+      where the "50 simultaneous requests" concurrency question lives.
+   4. **Path normalization**, a security fix found while reviewing how the API could be abused. It
+      jumped the queue.
+   5. **Auth**: an `auth` block the gateway ignored meant `/api/internal` was open to anyone, the most
+      serious remaining gap.
+   6. **Request limits** and a pass to make every feature's success and failure cases tested.
+   7. **Load balancing**, then making sure **any valid config** works (which found config combinations
+      that loaded but then misbehaved), then **health checks**.
+   8. **Request/response transforms** last, and not done: they have the most surface area and the most
+      ambiguity in the spec, they're used on one route, and they're the least about the gateway's core
+      job of routing traffic safely and reliably.
 
-## Architecture
+## Architecture choices and trade-offs
 
 ### Request flow
 
@@ -87,9 +110,9 @@ Key choices:
   (cheap rejections like auth and rate limiting first).
 - **Errors are typed.** Anything that should become a specific response is a `GatewayError`
   (status + machine-readable code). Middleware that rejects a request outright (rate limiting, auth)
-  returns it as a response; failures deeper in the pipeline throw it. Upstream failures are distinct types (`UpstreamUnavailableError`
-  → 502, `UpstreamTimeoutError` → 504), which retry and the circuit breaker can tell apart. Any other
-  exception becomes a logged 500, never a crash.
+  returns it as a response; failures deeper in the pipeline throw it. Upstream failures are distinct
+  types (`UpstreamUnavailableError` → 502, `UpstreamTimeoutError` → 504), which retry and the circuit
+  breaker can tell apart. Any other exception becomes a logged 500, never a crash.
 
 ### Config (`src/config/`)
 
@@ -121,8 +144,9 @@ Key choices:
 - Every request gets an `X-Request-Id` (the client's, or a new UUID). It is forwarded upstream,
   returned to the client and included in log lines, so one request can be traced across services.
 - **Request bodies are buffered** (capped at 10 MB → 413). That's needed to replay a body on retry, and
-  will be needed to rewrite it in `request_transform`. The trade-off is memory per in-flight request and no streaming
-  uploads; a production version would buffer only on routes that need it and stream otherwise.
+  will be needed to rewrite it in `request_transform`. The trade-off is memory per in-flight request and
+  no streaming uploads; a production version would buffer only on routes that need it and stream
+  otherwise.
 - **Request line and headers are capped at 16 KB** (431), which is where the query string lives. The
   limit is set explicitly on the server rather than inherited from Node's default, so it can't change
   underneath us. AWS API Gateway's HTTP APIs allow 10,240 bytes; 16 KB is a bit more generous for long
@@ -138,6 +162,33 @@ Key choices:
   keep upstream work going.
 - **Graceful shutdown** on SIGINT/SIGTERM: stop accepting connections, let in-flight requests finish
   (10s grace), then close.
+
+## Security
+
+Security is a top concern for a gateway: it sits in front of every service, so anything it lets through,
+leaks or mishandles affects all of them. The approach is **fail closed** (refuse to start on a bad
+config, reject ambiguous requests, answer 503 rather than guess when no healthy target exists), **trust
+nothing from the client** that it could fake, and **never write secrets anywhere**.
+
+| Threat | Protection |
+| --- | --- |
+| Calling a protected route without permission | API key auth on routes that configure it (401, upstream never called). |
+| Guessing an API key | Constant-time comparison (no timing hints about the key or its length); auth runs after rate limiting, so every failed guess uses up the client's budget. |
+| Leaking API keys | The key header is removed before forwarding, and keys never appear in logs. |
+| Escaping a route's prefix with `..` (`/api/products/../internal`) | Paths are normalized before routing, so the request is routed (and authenticated) as what it really is. Climbing above `/` is a 400. |
+| Encoded slashes, backslashes, null bytes in paths | 400. Upstreams disagree on how to read them, which is the classic way to get the gateway and the upstream to see different paths. |
+| Faking a client IP to dodge rate limits | `X-Forwarded-For` from the client is passed along but never used to identify the client; the socket address is. |
+| Exhausting gateway memory | 10 MB body limit (413), 16 KB limit on request line + headers (431), idle rate limit counters swept, oversized uploads drained for at most 5 seconds. |
+| Malformed or hostile HTTP | Rejected by Node's parser with a JSON 400 before any gateway code runs; hop-by-hop headers are never forwarded. |
+| Retries making things worse | POST/PATCH are only retried if the request provably never arrived (no duplicate orders); the circuit breaker stops retries against a failing upstream; exponential backoff is capped. |
+| A slow or dead upstream tying up the gateway | Timeouts on every upstream call, circuit breakers, health checks, and cancelling upstream work when the client disconnects. |
+| Personal data and secrets in logs | Access logs record method, path, route, status and timing only: never bodies, headers or query strings. |
+| Config mistakes that weaken things silently | Rejected at startup: header values with line breaks (header injection), invalid header names (an auth header that could never match), upstream URLs with embedded credentials, route paths that could never match. |
+
+Known gaps, in "What I'd build next": API keys sit in the config file in plain text (production would
+read them from environment variables or a secret manager, and ideally store only hashes); there's no TLS
+termination; rate limits are per instance; on a `per: "global"` route, unauthenticated requests can use up
+the shared budget; and there's no cap on simultaneous connections or on clients that send very slowly.
 
 ## Calls on ambiguities in the spec
 
@@ -284,15 +335,25 @@ The brief says ambiguities are intentional; these are the calls I made:
     all `/api/products` traffic went to `products-a`. Also added a test for starting on a port
     that's already in use.
 
-**Done and tested:** config loading and validation of the full schema, `/health`, routing, 404, 405,
+### Done and tested
+
+Config loading and validation of the full schema, `/health`, routing, 404, 405, path normalization,
 proxying (headers, body, query string, streaming), `strip_prefix`, per-route and global timeouts, 502/504
 handling, request IDs, access logs, graceful shutdown, retry with fixed/exponential backoff, circuit
-breaker, rate limiting (fixed and sliding window, per IP or global), path normalization, API key auth,
-request size limits (10 MB body, 16 KB request line + headers) with JSON errors, load balancing
-(round robin and weighted), active health checks.
+breaker, rate limiting (fixed and sliding window, per IP or global), API key auth, request size limits
+(10 MB body, 16 KB request line + headers) with JSON errors, load balancing (round robin and weighted),
+active health checks.
 
-**Parsed and validated but not enforced yet:** request/response transforms. The gateway logs a startup
-warning for each.
+### Partially implemented
+
+| Feature | Current state |
+| --- | --- |
+| `request_transform` (header add/remove, `$request_time`, body `mapping`, `$literal:`) | Parsed and validated, including header names and values (no line breaks), but **not applied**. Requests are forwarded unchanged, and the gateway logs a startup warning for each route that configures it. |
+| `response_transform` (header add/remove, body `envelope`, `$body`, `$response_time`, `$route_path`) | Same: parsed and validated, **not applied**, with a startup warning. Responses stream through unchanged. |
+| Health checks | Active checks only, as the config describes. Real request failures don't take a target out of rotation (passive checks). |
+| Circuit breaker | Per route, as configured. With several targets, one failing target can open the breaker for the whole route. |
+| Auth | Static API keys from the config only: no per-client identity, expiry or rotation without a restart. |
+| Rate limiting | In memory, per gateway instance. Running several instances multiplies the effective limit. |
 
 ## Testing approach
 
@@ -318,6 +379,9 @@ that are hard to trigger on purpose.
   (opening on 5xx, unreachable and timed-out upstreams; recovering), auth, and request size limits.
   `strip_prefix` has its own file checking exactly what path and query string the upstream receives,
   and `pathSecurity` sends raw `..` paths that try to escape a route.
+- **Load balancing and health checks** (`balancer`, `loadBalancing`, `healthCheck`, `healthCheckRouting`):
+  exact pick order, 40 simultaneous requests splitting exactly 30/10, retries moving to the next target,
+  and unhealthy targets leaving and rejoining the rotation, with real checks every 50ms.
 - **Failure tests** (`test/failures.test.ts`) cover how the gateway behaves when things break: an
   upstream that resets the connection, answers with non-HTTP bytes, dies halfway through a response,
   never answers, or restarts on the same port; 50 requests at once to a dead upstream; a client that
@@ -328,7 +392,7 @@ that are hard to trigger on purpose.
   must warn. `test/alternateConfig.test.ts` runs a second shipped config end to end.
 - **CLI tests** start the real `src/index.ts` as a separate process: config from an argument or
   `GATEWAY_CONFIG`, refusal to start on an invalid or missing config (exit 1), usage message (exit 2),
-  and a clean exit 0 on SIGTERM.
+  a clean exit 0 on SIGTERM, and a clear exit 1 when the port is already in use.
 - The mock upstream (`mock/upstream.ts`) echoes requests and has endpoints for failure cases: slow,
   flaky, fixed status, dropped connection, truncated body and non-HTTP replies. `npm run mock` starts it
   on the example config's ports. Its `/flaky` endpoint has its own tests (`test/mock.test.ts`), since
@@ -336,8 +400,16 @@ that are hard to trigger on purpose.
 
 ## What I'd build next
 
-In order: the remaining features in the priority list above, then:
+In order:
 
+- **Request and response transforms**, the last spec feature. The config is already validated; the
+  work is applying it: header add/remove (with `$request_time`), dot-path body `mapping` with
+  `$literal:` values, and the response `envelope`, which means buffering the response body instead of
+  streaming it. Open questions to decide: what to do when a body isn't JSON (I'd forward it unchanged
+  and log a warning), and the timestamp format (ISO 8601).
+- **Security hardening:** read API keys from environment variables or a secret manager instead of
+  the config file; a separate limit on failed auth attempts; caps on simultaneous connections and on
+  clients that send very slowly; grouping IPv6 clients by /64 for rate limiting; TLS termination.
 - Distributed rate limiting (Redis or similar) for running several gateway instances.
 - Trusted-proxy config for reading the client IP from `X-Forwarded-For`.
 - Streaming request bodies on routes that need neither retry nor body transforms.
@@ -347,10 +419,8 @@ In order: the remaining features in the priority list above, then:
   only when its health endpoint does.
 - Per-target circuit breakers, so one failing target doesn't trip the breaker for a route's healthy
   targets.
-- More abuse protection: caps on risky config values (very large `retry.attempts`, or sliding-window
-  `requests` that would use a lot of memory), a cap on simultaneous connections, tighter timeouts for
-  slow-sending clients, grouping IPv6 clients by /64 for rate limiting, a separate limit on failed auth
-  attempts, and truncating very long paths in logs.
+- Caps on risky config values (very large `retry.attempts`, or sliding-window `requests` that would
+  use a lot of memory), and truncating very long paths in logs.
 - An optional exact-match mode for routes (`match: "exact"`, defaulting to today's `"prefix"`). The
   schema only has prefix matching, which `strip_prefix` depends on, so I didn't add a field the spec
   doesn't define. But exposing only `/api/users` without everything under it currently isn't possible.
@@ -363,3 +433,8 @@ working out the priorities and the architecture (pipeline of middleware, respons
 everything up front), then had it draft code and tests in that order. I reviewed and ran everything it
 produced: type-checked, ran the tests, and smoke-tested the real gateway against the mock upstreams with
 `curl` before each commit.
+
+I also used it to look for problems, not just to write code: reviewing how the API could be abused
+(which found the `..` path escape), running a coverage report to find untested code, probing the config
+validator with unusual combinations (which found the 30-day timeout that fired after 1 ms), and running
+every command in the README to check the docs matched reality.
