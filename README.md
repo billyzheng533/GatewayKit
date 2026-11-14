@@ -131,10 +131,12 @@ Type-check with `npm run typecheck`, or re-run tests on every change with `npm r
 | `test/config.test.ts` | Unit | Loading `gateway.yaml`, defaults, and rejecting malformed configs with every error listed |
 | `test/duration.test.ts` | Unit | Duration strings (`"500ms"`, `"30s"`, ...) and invalid ones |
 | `test/router.test.ts` | Unit | Prefix matching, most-specific-route wins, path rewriting |
+| `test/path.test.ts` | Unit | Path normalization: dot-segments, encoded dots, rejected paths |
 | `test/circuitBreaker.test.ts` | Unit | Breaker state machine with a fake clock: opening, cooldown, half-open trial |
 | `test/limiters.test.ts` | Unit | Fixed and sliding window algorithms with a fake clock |
 | `test/gateway.test.ts` | Integration | `/health`, proxying, 404, 405, headers, 502, 504, 413, 50 concurrent requests |
 | `test/stripPrefix.test.ts` | Integration | Exactly which path and query string the upstream receives |
+| `test/pathSecurity.test.ts` | Integration | `..` tricks that try to escape a route's prefix, sent raw so the client can't tidy them up |
 | `test/resilience.test.ts` | Integration | Retry (recovery, giving up, backoff, no duplicate POSTs) and circuit breaker |
 | `test/rateLimit.test.ts` | Integration | 429s and headers, 50 simultaneous requests, window resets, per IP vs. global, inherited limits |
 | `test/failures.test.ts` | Integration | Upstreams that reset, send garbage, die mid-response, hang, or restart; clients that disconnect |
@@ -150,6 +152,7 @@ Type-check with `npm run typecheck`, or re-run tests on every change with `npm r
 | `GET /health` (always available, takes precedence over routes) | ✅ |
 | Route matching by path prefix (segment boundary, most specific wins), 404 otherwise | ✅ |
 | `methods` filtering, 405 with `Allow` header | ✅ |
+| Path normalization: `..`/`%2e%2e` resolved before routing; encoded slashes, backslashes and climbing above `/` rejected (400) | ✅ |
 | Proxying (method, path, query, headers, body; streamed responses) | ✅ |
 | `strip_prefix` | ✅ |
 | `global_timeout` / `upstream.timeout` (504 on timeout, 502 when unreachable) | ✅ |

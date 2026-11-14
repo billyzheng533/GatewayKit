@@ -101,6 +101,14 @@ Key choices:
 - Node's `http`/`https` client with keep-alive agents shared across routes (connection reuse).
 - Hop-by-hop headers (`Connection`, `Transfer-Encoding`, ... and anything named in `Connection`) are
   dropped in both directions; `X-Forwarded-For/Host/Proto` are added; `Host` is set to the upstream.
+- **Paths are normalized before routing** (`src/path.ts`). Without this, `/api/products/../internal`
+  matched the products route, was stripped to `/../internal`, and the products service resolved that to
+  `/internal`: a client could reach any path on an upstream, not just the ones under its route. Now
+  `.`, `..` and their encoded forms (`%2e%2e`) are resolved first, so that request is routed as
+  `/api/internal` and gets that route's rules. Paths that climb above `/` are rejected with 400, as
+  are encoded slashes (`%2F`), backslashes and null bytes: upstreams disagree on whether those
+  separate path segments, which is the usual way routing gets bypassed. Logs record the path as the
+  client sent it, so attempts are visible.
 - Every request gets an `X-Request-Id` (the client's, or a new UUID). It is forwarded upstream,
   returned to the client and included in log lines, so one request can be traced across services.
 - **Request bodies are buffered** (capped at 10 MB → 413). That's needed to replay a body on retry and
@@ -130,6 +138,8 @@ The brief says ambiguities are intentional; these are the calls I made:
 | Unreachable upstream vs. slow upstream | 502 `bad_gateway` vs. 504 `gateway_timeout`. Upstream 4xx/5xx responses pass through unchanged. |
 | Error response shape | All gateway-generated errors are JSON `{ "error": "<code>", "message": "..." }`. The one exception is the open circuit breaker, which returns exactly the body the spec gives: `{ "error": "service_unavailable", "retry_after": <seconds> }`. |
 | Which client IP is used? | The socket's remote address. `X-Forwarded-For` from the client is passed along but **not** trusted for identifying the client, since a client could set it to dodge per-IP rate limits. Behind a trusted load balancer this would become a config option. |
+| A path with `..` in it | Resolved before routing, so it's routed to wherever it really points (`/api/products/../internal` → `/api/internal`). Climbing above `/` is a 400, not quietly clamped to `/`. |
+| Encoded slashes (`%2F`) in a path | 400. Some upstreams decode them into real slashes and some don't, so allowing them means the gateway and the upstream can disagree about which path was requested. |
 | Is `gateway.port` used? | Yes; it defaults to 8080 if missing. |
 | Unknown config keys | Warning, gateway still starts. Invalid values for known keys: startup fails. |
 
@@ -184,6 +194,10 @@ The brief says ambiguities are intentional; these are the calls I made:
 5. **Rate limiting finished.** Tests for both algorithms with a fake clock, then end to end, including
    50 simultaneous requests against a limit of 10. Checked with the example config: `/api/orders` lets
    exactly 10 requests through per 10 seconds.
+6. **Path normalization (security fix).** While reviewing how the API could be abused, I found that
+   `..` in a path escaped the route prefix (`/api/products/../internal/secret` reached
+   `/internal/secret` on the products service). Fixed before adding more features, with tests that
+   send raw paths, since `fetch` and `curl` tidy up `..` themselves and would hide the problem.
 
 **Done and tested:** config loading and validation of the full schema, `/health`, routing, 404, 405,
 proxying (headers, body, query string, streaming), `strip_prefix`, per-route and global timeouts, 502/504

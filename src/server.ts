@@ -9,6 +9,7 @@ import { silentLogger, type Logger } from './logger.js';
 import { compose, type GatewayResponse, type Handler, type RequestContext } from './pipeline.js';
 import { UpstreamClient } from './proxy/client.js';
 import { createUpstreamHandler } from './proxy/upstream.js';
+import { normalizePath } from './path.js';
 import { Router } from './router.js';
 
 /** Request bodies are buffered (for retries and transforms); cap them to protect memory. */
@@ -63,7 +64,7 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
   async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const started = performance.now();
     const method = (req.method ?? 'GET').toUpperCase();
-    const { path, query } = splitUrl(req.url ?? '/');
+    const { path: rawPath, query } = splitUrl(req.url ?? '/');
     const requestId = singleHeader(req.headers['x-request-id']) ?? randomUUID();
     let routePath: string | undefined;
 
@@ -72,12 +73,20 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
       logger.info('request', {
         request_id: requestId,
         method,
-        path,
+        path: rawPath, // as the client sent it, so odd or malicious paths show up in logs
         route: routePath ?? null,
         status: res.statusCode,
         duration_ms: Math.round(performance.now() - started),
       });
     });
+
+    // Resolve "..", "%2e%2e" etc. first, so routing and forwarding see the same path.
+    let path: string;
+    try {
+      path = normalizePath(rawPath);
+    } catch (err) {
+      return sendError(res, err as GatewayError);
+    }
 
     // Built in, takes precedence over any configured route.
     if (path === '/health') {
