@@ -155,6 +155,7 @@ Every implemented feature has tests for both what should work and what should fa
 | `/health` | 200 with integer uptime; HEAD; wins over a catch-all `/` route | 405 for other methods | `gateway` |
 | Routing and methods | Prefix match, most specific route wins, catch-all | 404 for no match or a partial prefix (`/api/usersX`); 405 with `Allow` | `router`, `gateway` |
 | Path normalization | `.`, `..` and `%2e%2e` resolved; repeated slashes collapsed | 400 for climbing above `/`, `%2F`, `%5C`, `\`, `%00`; prefix-escape attempts | `path`, `pathSecurity` |
+| Request limits | A long query string within 16 KB is forwarded unchanged | 431 for an oversized query string, header or set of headers; 400 for malformed HTTP; neither reaches the upstream | `requestLimits` |
 | Proxying | Method, path, query, body and headers forwarded; `X-Forwarded-*`; request IDs; 50 concurrent requests | Hop-by-hop headers dropped; 413 for oversized bodies; upstream reset or non-HTTP reply gives 502; upstream dying mid-response; client disconnects; an internal bug gives 500 and the gateway keeps serving | `headers`, `gateway`, `failures` |
 | `strip_prefix` | Nested paths, bare prefix, query kept, upstream base path, `false` keeps path | No stripping on a partial prefix | `stripPrefix` |
 | Timeouts | Route and global timeouts | 504 for a slow or hanging upstream, without waiting for it | `gateway`, `failures` |
@@ -166,6 +167,19 @@ Every implemented feature has tests for both what should work and what should fa
 
 Files are in `test/` and named `<name>.test.ts`. Unit tests use a fake clock where time matters, so
 windows and cooldowns are tested without waiting. Integration tests talk to a real gateway over HTTP.
+
+## Request limits
+
+These protect the gateway's memory and match AWS API Gateway's defaults closely. They aren't
+configurable, since the config schema has no field for them.
+
+| Limit | Value | Over the limit |
+| --- | --- | --- |
+| Request body | 10 MB (same as AWS API Gateway) | 413 `{"error":"payload_too_large",...}` |
+| Request line + headers, including the query string | 16 KB (AWS HTTP APIs: 10 KB) | 431 `{"error":"request_header_too_large",...}` |
+| Malformed HTTP | | 400 `{"error":"bad_request",...}` |
+
+None of these requests reach an upstream.
 
 ## Config feature checklist
 

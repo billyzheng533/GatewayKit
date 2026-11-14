@@ -114,6 +114,12 @@ Key choices:
 - **Request bodies are buffered** (capped at 10 MB → 413). That's needed to replay a body on retry and
   to rewrite it in `request_transform`. The trade-off is memory per in-flight request and no streaming
   uploads; a production version would buffer only on routes that need it and stream otherwise.
+- **Request line and headers are capped at 16 KB** (431), which is where the query string lives. The
+  limit is set explicitly on the server rather than inherited from Node's default, so it can't change
+  underneath us. AWS API Gateway's HTTP APIs allow 10,240 bytes; 16 KB is a bit more generous for long
+  query strings. Node rejects these requests (and malformed HTTP) before our handler runs, so the
+  gateway hooks Node's `clientError` event to answer them in the same JSON error format as every
+  other error, instead of Node's bare response.
 - **Oversized bodies get a clean 413.** Stopping the read mid-upload resets the connection, and
   clients then report a broken pipe instead of the 413 (a test caught this). The gateway sends the 413
   and drains the rest of the body in the background, for at most 5 seconds.
@@ -268,6 +274,10 @@ In order: the remaining features in the priority list above, then:
 - Streaming request bodies on routes that need neither retry nor body transforms.
 - Config hot reload (rebuild pipelines and swap the router atomically).
 - Metrics (request counts, latency histograms per route and upstream) alongside the access log.
+- An optional exact-match mode for routes (`match: "exact"`, defaulting to today's `"prefix"`). The
+  schema only has prefix matching, which `strip_prefix` depends on, so I didn't add a field the spec
+  doesn't define. But exposing only `/api/users` without everything under it currently isn't possible.
+  It would be a small router change, and existing configs would behave the same.
 
 ## How I used AI tools
 

@@ -14,6 +14,13 @@ import { Router } from './router.js';
 
 /** Request bodies are buffered (for retries and transforms); cap them to protect memory. */
 export const MAX_BODY_BYTES = 10 * 1024 * 1024;
+/**
+ * Request line + headers (which is where the query string lives). Set
+ * explicitly rather than relying on Node's default, so the limit can't change
+ * underneath us. AWS API Gateway's HTTP APIs allow 10,240 bytes; 16 KB is a
+ * little more generous for long query strings.
+ */
+export const MAX_HEADER_BYTES = 16 * 1024;
 const SHUTDOWN_GRACE_MS = 10_000;
 
 export interface GatewayOptions {
@@ -54,11 +61,35 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
     })),
   );
 
-  const server = http.createServer((req, res) => {
+  const server = http.createServer({ maxHeaderSize: MAX_HEADER_BYTES }, (req, res) => {
     handleRequest(req, res).catch((err: unknown) => {
       logger.error('unhandled error while handling request', { error: String(err) });
       res.destroy();
     });
+  });
+
+  // Requests Node rejects while parsing (too-large headers, malformed HTTP) never
+  // reach handleRequest. Answer them in the same JSON error format as everything else.
+  server.on('clientError', (err: NodeJS.ErrnoException, socket) => {
+    if (err.code === 'ECONNRESET' || !socket.writable) {
+      socket.destroy();
+      return;
+    }
+    const error =
+      err.code === 'HPE_HEADER_OVERFLOW'
+        ? new GatewayError(431, 'request_header_too_large', `request line and headers exceed ${MAX_HEADER_BYTES} bytes`)
+        : err.code === 'HPE_REQUEST_TIMEOUT' || err.code === 'ERR_HTTP_REQUEST_TIMEOUT'
+          ? new GatewayError(408, 'request_timeout', 'request was not received in time')
+          : new GatewayError(400, 'bad_request', 'malformed HTTP request');
+    logger.warn('rejected malformed request', { status: error.status, reason: err.code ?? err.message });
+    const body = JSON.stringify(error.toBody());
+    socket.end(
+      `HTTP/1.1 ${error.status} ${http.STATUS_CODES[error.status]}\r\n` +
+        'Content-Type: application/json\r\n' +
+        `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+        'Connection: close\r\n\r\n' +
+        body,
+    );
   });
 
   async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
