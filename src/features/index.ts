@@ -52,7 +52,6 @@ export function buildRouteMiddleware(route: RouteConfig, deps: FeatureDeps): Mid
  * startup so nobody assumes, say, auth is on when it isn't.
  */
 const NOT_YET_ENFORCED: Array<[keyof RouteConfig, string]> = [
-  ['healthCheck', 'health_check'],
   ['requestTransform', 'request_transform'],
   ['responseTransform', 'response_transform'],
 ];

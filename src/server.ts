@@ -8,6 +8,7 @@ import { buildRouteMiddleware } from './features/index.js';
 import { silentLogger, type Logger } from './logger.js';
 import { compose, type GatewayResponse, type Handler, type RequestContext } from './pipeline.js';
 import { UpstreamClient } from './proxy/client.js';
+import { HealthChecker } from './proxy/healthCheck.js';
 import { createUpstreamHandler } from './proxy/upstream.js';
 import { normalizePath } from './path.js';
 import { Router } from './router.js';
@@ -49,6 +50,16 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
   const client = new UpstreamClient();
   const startedAt = Date.now();
 
+  // Routes with `health_check` get a checker; the load balancer skips targets it marks unhealthy.
+  const healthCheckers: HealthChecker[] = [];
+  const healthFilter = (route: RouteConfig) => {
+    if (!route.healthCheck) return undefined;
+    const checkTimeoutMs = Math.min(route.upstream.timeoutMs, route.healthCheck.intervalMs);
+    const checker = new HealthChecker(route.path, route.upstream.targets, route.healthCheck, checkTimeoutMs, logger);
+    healthCheckers.push(checker);
+    return checker.isHealthy;
+  };
+
   // Every route's pipeline is built once, at startup, from its config.
   const router = new Router<CompiledRoute>(
     config.routes.map((route) => ({
@@ -56,7 +67,7 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
       config: route,
       handler: compose(
         buildRouteMiddleware(route, { logger, now: options.now ?? Date.now }),
-        createUpstreamHandler(route, client),
+        createUpstreamHandler(route, client, healthFilter(route)),
       ),
     })),
   );
@@ -187,11 +198,15 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
     });
   });
 
+  // Health checks start only once the gateway is actually serving.
+  for (const checker of healthCheckers) checker.start();
+
   const { port } = server.address() as AddressInfo;
   return {
     port,
     url: `http://127.0.0.1:${port}`,
     async close() {
+      for (const checker of healthCheckers) checker.stop();
       // Stop accepting connections, let in-flight requests finish, then force-close stragglers.
       const closed = new Promise<void>((resolve) => server.close(() => resolve()));
       server.closeIdleConnections();

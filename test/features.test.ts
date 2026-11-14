@@ -18,7 +18,6 @@ routes:
     response_transform: { headers: { remove: ["Server"] } }
 `);
     expect(unenforcedFeatureWarnings(config)).toEqual([
-      'route /api/products: "health_check" is configured but not implemented yet; it is ignored',
       'route /api/legacy: "request_transform" is configured but not implemented yet; it is ignored',
       'route /api/legacy: "response_transform" is configured but not implemented yet; it is ignored',
     ]);

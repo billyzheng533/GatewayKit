@@ -57,7 +57,7 @@ client → Node's HTTP parser               → 431 if request line + headers > 
            ├─ read body (10 MB cap)       → 413 if larger
            └─ route.handler(ctx)          ← composed once at startup, per route:
                  rate_limit (429) → auth (401) → retry → circuit_breaker (503)
-                   → upstream handler (load balancer picks a target) → UpstreamClient
+                   → upstream handler (load balancer picks a healthy target; 503 if none) → UpstreamClient
                    → upstream (502 unreachable, 504 timeout)
          ← response written once, by the server
 ```
@@ -103,7 +103,7 @@ Key choices:
 - **Unknown keys are warnings, not errors**: a typo like `strip_prefx` is flagged, but a config written
   for a newer version still loads.
 - **Configured-but-unimplemented features are logged at startup** for each route, so nobody assumes,
-  say, health checks are running when they aren't.
+  say, response transforms are applied when they aren't.
 
 ### Proxying (`src/proxy/`)
 
@@ -202,8 +202,21 @@ The brief says ambiguities are intentional; these are the calls I made:
 | A single `url` | Treated as one target; no balancing logic runs. |
 | Concurrency | Picking a target is synchronous, so simultaneous requests can't race on the rotation: 40 requests at once at 3:1 split exactly 30/10. There's a test for this. |
 | Retry with several targets | The target is picked per attempt, so a retry goes to the next target in the rotation rather than back to the one that just failed. A dead target plus `retry` still gives the client a 200. |
-| A dead target, no retry | Until health checks exist, it stays in the rotation, so its share of requests gets 502. The balancer can already skip targets (`pick` takes a filter); health checks will supply the filter. |
+| A dead target, no retry | With `health_check`, it's taken out of the rotation once it fails `unhealthy_threshold` checks; until then (and on routes without health checks) its share of requests gets 502. |
 | Balancer state | Per route, in memory. The rotation restarts when the gateway restarts. |
+
+### Health checks
+
+| Question | Decision |
+| --- | --- |
+| What counts as a passing check? | A 2xx response from `GET <target><path>`. Connection errors, timeouts and any other status fail. The check path is relative to the target, so a target URL with a base path (`http://svc/v2`) is checked at `/v2/healthz`. |
+| When is a target unhealthy, and when does it recover? | Unhealthy after `unhealthy_threshold` failed checks in a row; one success in between resets the count. Healthy again after a single passing check. The spec only defines the unhealthy side; recovering on one success gets a target back into service as soon as it's up. |
+| Check timeout | The route's upstream timeout or the check interval, whichever is shorter, so a hanging target can't stall its own checks. |
+| At startup | Targets start healthy and the first round of checks runs immediately, so traffic flows from the start and a dead target is found within `unhealthy_threshold` intervals. |
+| Every target unhealthy | 503 `{ "error": "no_healthy_upstream", ... }` right away, with no upstream call. Sending traffic to targets known to be down would only produce slow 502s. Some gateways "fail open" instead (send to all targets when none look healthy, in case the health endpoint itself is what's broken); that's a reasonable alternative I'd make configurable. |
+| Overlapping checks | If a target's previous check is still running, the next one is skipped rather than piling up. |
+| Shutdown | Checks start only once the gateway is listening, and stop (including checks in flight) when it shuts down. Their timers never keep the process alive. |
+| Passive checks | Only active checks, as configured. Real request failures don't mark a target unhealthy (that's what the circuit breaker is for); see "What I'd build next". |
 
 ### Rate limiting
 
@@ -265,16 +278,21 @@ The brief says ambiguities are intentional; these are the calls I made:
     configs that were wrongly rejected (`"1m30s"`, YAML merge keys). All fixed, with a test matrix of
     valid configs that must serve traffic, invalid combinations that must fail, and a second shipped
     config (`examples/alternate-gateway.yaml`) run end to end.
+12. **Health checks.** Each target is checked on the configured path; the load balancer skips
+    unhealthy ones, and a route with no healthy target answers 503 without calling anything. Checked
+    with the example config (interval shortened to 1s, `products-b` stopped): after 3 failed checks,
+    all `/api/products` traffic went to `products-a`. Also added a test for starting on a port
+    that's already in use.
 
 **Done and tested:** config loading and validation of the full schema, `/health`, routing, 404, 405,
 proxying (headers, body, query string, streaming), `strip_prefix`, per-route and global timeouts, 502/504
 handling, request IDs, access logs, graceful shutdown, retry with fixed/exponential backoff, circuit
 breaker, rate limiting (fixed and sliding window, per IP or global), path normalization, API key auth,
 request size limits (10 MB body, 16 KB request line + headers) with JSON errors, load balancing
-(round robin and weighted).
+(round robin and weighted), active health checks.
 
-**Parsed and validated but not enforced yet:** health checks, request/response transforms. The gateway
-logs a startup warning for each.
+**Parsed and validated but not enforced yet:** request/response transforms. The gateway logs a startup
+warning for each.
 
 ## Testing approach
 
@@ -325,6 +343,8 @@ In order: the remaining features in the priority list above, then:
 - Streaming request bodies on routes that need neither retry nor body transforms.
 - Config hot reload (rebuild pipelines and swap the router atomically).
 - Metrics (request counts, latency histograms per route and upstream) alongside the access log.
+- Passive health checks: take a target out of rotation when real requests to it keep failing, not
+  only when its health endpoint does.
 - Per-target circuit breakers, so one failing target doesn't trip the breaker for a route's healthy
   targets.
 - More abuse protection: caps on risky config values (very large `retry.attempts`, or sliding-window

@@ -219,7 +219,7 @@ the gateway forwarded. It also has endpoints for failure cases, under any path p
 | `/status/<code>` | Responds with that HTTP status |
 | `/slow?ms=<n>` | Waits `n` ms, then echoes |
 | `/flaky?fail=<n>&key=<k>` | Returns 503 for the first `n` calls with that key, then echoes (details below) |
-| `/healthz` | Health check endpoint, returns 200 |
+| `/healthz` | Health check endpoint: 200, or 503 while a test has marked the mock unhealthy (`setHealthy(false)`) |
 | `/reset` | Drops the connection without responding |
 | `/truncate` | Sends headers and part of the body, then drops the connection |
 | `/garbage` | Answers with bytes that aren't HTTP |
@@ -313,6 +313,7 @@ Every implemented feature has tests for both what should work and what should fa
 | Timeouts | Route and global timeouts | 504 for a slow or hanging upstream, without waiting for it | `gateway`, `failures` |
 | Retry | Recovers after failures; fixed and exponential timing; PUT retried with its body | Gives up after `attempts`; statuses not in `on` not retried; POST not duplicated; stops when the client disconnects | `resilience`, `resilienceFailures` |
 | Circuit breaker | Stays closed on success and 4xx; recovers through a half-open trial | Opens on 5xx, unreachable and timed-out upstreams; failed trial re-opens; 401s don't count | `circuitBreaker`, `resilience`, `resilienceFailures`, `failures`, `auth` |
+| Health checks | Checks the configured path on every target; a failing target is taken out of rotation after `unhealthy_threshold` checks and put back after one success | Down, failing and too-slow targets are skipped; 503 without any upstream call when no target is healthy; checks stop on shutdown; failure count resets on success | `healthCheck`, `healthCheckRouting` |
 | Load balancing | Round robin; weighted 3:1 spread out (A, A, B, A); 40 simultaneous requests split exactly 30/10; `strip_prefix` on every target | A retried attempt moves to the next target; a dead target gives 502 only for its share; all targets down gives 502 | `balancer`, `loadBalancing` |
 | Rate limiting | Admits the limit; headers; windows reset; inherited global limit | 429 with `retry_after`; 50 simultaneous requests against a limit of 10; fake `X-Forwarded-For` ignored; per IP vs. global | `limiters`, `rateLimit` |
 | Auth | Every configured key; custom header name; key not forwarded | Missing, wrong, empty, partial, wrong-case and duplicate keys; `..` bypass attempt; failed guesses rate limited | `auth` |
@@ -354,7 +355,7 @@ None of these requests reach an upstream.
 | `auth` (`api_key`: constant-time key check, 401, key not forwarded upstream) | ✅ |
 | `circuit_breaker` (`threshold` in `window`, `cooldown`, half-open trial, 503 with `retry_after`) | ✅ |
 | `upstream.targets` load balancing (`round_robin`, `weighted_round_robin`; retries move to the next target) | ✅ |
-| `health_check` | ⏳ parsed, not enforced |
+| `health_check` (`path`, `interval`, `unhealthy_threshold`; unhealthy targets skipped, 503 if none left) | ✅ |
 | `request_transform` (headers, body mapping) | ⏳ parsed, not enforced |
 | `response_transform` (headers, body envelope) | ⏳ parsed, not enforced |
 
@@ -378,7 +379,8 @@ src/
     auth/               API key check
     retry/              Retry with backoff
     circuitBreaker/     Breaker state machine and middleware
-  proxy/              Upstream HTTP client, load balancer, hop-by-hop header handling, terminal upstream handler
+  proxy/              Upstream HTTP client, load balancer, health checks, hop-by-hop header handling,
+                      terminal upstream handler
 mock/                 Mock upstream server (used by tests and `npm run mock`)
 examples/             A second, different config, to show any valid config works
 test/                 Unit and integration tests

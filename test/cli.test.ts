@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -123,5 +125,26 @@ routes:
     const run = runCli([], { GATEWAY_CONFIG: '' }); // in case the developer's shell sets it
     expect(await run.exited).toBe(2);
     expect(run.stderr()).toContain('Usage: gatewaykit');
+  });
+  it('exits 1 with a clear message when the port is already in use', async () => {
+    // Something else is already listening on the port the config asks for.
+    const squatter = http.createServer((_req, res) => res.end('busy'));
+    await new Promise<void>((resolve) => squatter.listen(0, resolve));
+    const { port } = squatter.address() as AddressInfo;
+    try {
+      const path = await writeConfig(
+        'port-taken.yaml',
+        `gateway: { port: ${port} }\nroutes: [{ path: "/a", methods: ["GET"], upstream: { url: "http://127.0.0.1:1" } }]`,
+      );
+      const run = runCli([path]);
+      expect(await run.exited).toBe(1);
+      expect(run.stderr()).toContain(`Cannot listen on port ${port}: it is already in use. Change gateway.port in ${path}.`);
+      expect(run.stderr()).not.toContain('at Server.'); // a clean message, not a stack trace
+      expect(run.stdout()).not.toContain('gateway listening');
+      // The process that had the port is unaffected.
+      expect(await (await fetch(`http://127.0.0.1:${port}/`)).text()).toBe('busy');
+    } finally {
+      await new Promise<void>((resolve) => squatter.close(() => resolve()));
+    }
   });
 });
