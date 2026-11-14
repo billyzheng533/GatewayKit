@@ -19,7 +19,6 @@ routes:
 `);
     expect(unenforcedFeatureWarnings(config)).toEqual([
       'route /api/products: "health_check" is configured but not implemented yet; it is ignored',
-      'route /api/products: load balancing is not implemented yet; all traffic goes to the first target',
       'route /api/legacy: "request_transform" is configured but not implemented yet; it is ignored',
       'route /api/legacy: "response_transform" is configured but not implemented yet; it is ignored',
     ]);

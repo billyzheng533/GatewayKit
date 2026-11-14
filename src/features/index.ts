@@ -65,9 +65,6 @@ export function unenforcedFeatureWarnings(config: GatewayConfig): string[] {
         warnings.push(`route ${route.path}: "${label}" is configured but not implemented yet; it is ignored`);
       }
     }
-    if (route.upstream.targets.length > 1) {
-      warnings.push(`route ${route.path}: load balancing is not implemented yet; all traffic goes to the first target`);
-    }
   }
   return warnings;
 }

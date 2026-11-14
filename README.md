@@ -154,8 +154,13 @@ x-ratelimit-reset: 60
 
 What to notice:
 - `"path": "/123"`: the `/api/products` prefix was stripped.
-- `x-upstream: products-a`: load balancing isn't built yet, so every request goes to the route's first
-  target (port 3003), never `products-b`.
+- `x-upstream: products-a`: this route balances across two targets with weights 3:1, so it goes
+  `products-a`, `products-a`, `products-b`, `products-a`, then repeats. A fresh gateway's first
+  request goes to `products-a` (port 3003). To see the split:
+
+  ```bash
+  for i in $(seq 1 8); do curl -s -D - -o /dev/null "localhost:8080/api/products/$i" | grep -i '^x-upstream'; done
+  ```
 - The limit is 100 per 60 seconds, inherited from `global_rate_limit`, because this route doesn't set
   its own.
 
@@ -279,6 +284,7 @@ Every implemented feature has tests for both what should work and what should fa
 | Timeouts | Route and global timeouts | 504 for a slow or hanging upstream, without waiting for it | `gateway`, `failures` |
 | Retry | Recovers after failures; fixed and exponential timing; PUT retried with its body | Gives up after `attempts`; statuses not in `on` not retried; POST not duplicated; stops when the client disconnects | `resilience`, `resilienceFailures` |
 | Circuit breaker | Stays closed on success and 4xx; recovers through a half-open trial | Opens on 5xx, unreachable and timed-out upstreams; failed trial re-opens; 401s don't count | `circuitBreaker`, `resilience`, `resilienceFailures`, `failures`, `auth` |
+| Load balancing | Round robin; weighted 3:1 spread out (A, A, B, A); 40 simultaneous requests split exactly 30/10; `strip_prefix` on every target | A retried attempt moves to the next target; a dead target gives 502 only for its share; all targets down gives 502 | `balancer`, `loadBalancing` |
 | Rate limiting | Admits the limit; headers; windows reset; inherited global limit | 429 with `retry_after`; 50 simultaneous requests against a limit of 10; fake `X-Forwarded-For` ignored; per IP vs. global | `limiters`, `rateLimit` |
 | Auth | Every configured key; custom header name; key not forwarded | Missing, wrong, empty, partial, wrong-case and duplicate keys; `..` bypass attempt; failed guesses rate limited | `auth` |
 | Startup warnings | Silent for implemented features | Warns for each configured feature that isn't built yet | `features` |
@@ -318,7 +324,7 @@ None of these requests reach an upstream.
 | `retry` (`fixed` / `exponential` backoff, `on` status codes; POST only retried if never sent) | ✅ |
 | `auth` (`api_key`: constant-time key check, 401, key not forwarded upstream) | ✅ |
 | `circuit_breaker` (`threshold` in `window`, `cooldown`, half-open trial, 503 with `retry_after`) | ✅ |
-| `upstream.targets` load balancing (`round_robin`, `weighted_round_robin`) | ⏳ uses first target |
+| `upstream.targets` load balancing (`round_robin`, `weighted_round_robin`; retries move to the next target) | ✅ |
 | `health_check` | ⏳ parsed, not enforced |
 | `request_transform` (headers, body mapping) | ⏳ parsed, not enforced |
 | `response_transform` (headers, body envelope) | ⏳ parsed, not enforced |
@@ -343,7 +349,7 @@ src/
     auth/               API key check
     retry/              Retry with backoff
     circuitBreaker/     Breaker state machine and middleware
-  proxy/              Upstream HTTP client, hop-by-hop header handling, terminal upstream handler
+  proxy/              Upstream HTTP client, load balancer, hop-by-hop header handling, terminal upstream handler
 mock/                 Mock upstream server (used by tests and `npm run mock`)
 test/                 Unit and integration tests
 ```

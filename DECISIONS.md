@@ -57,7 +57,8 @@ client → Node's HTTP parser               → 431 if request line + headers > 
            ├─ read body (10 MB cap)       → 413 if larger
            └─ route.handler(ctx)          ← composed once at startup, per route:
                  rate_limit (429) → auth (401) → retry → circuit_breaker (503)
-                   → upstream handler → UpstreamClient → upstream (502 unreachable, 504 timeout)
+                   → upstream handler (load balancer picks a target) → UpstreamClient
+                   → upstream (502 unreachable, 504 timeout)
          ← response written once, by the server
 ```
 
@@ -170,7 +171,7 @@ The brief says ambiguities are intentional; these are the calls I made:
 | How is `window` counted? | A sliding window: the breaker opens when `threshold` failures happened within the last `window`. Successes don't reset the count. |
 | What happens after `cooldown`? | Half-open: exactly one trial request goes through. Success closes the breaker; failure re-opens it for another full cooldown. Other requests are rejected while the trial is in flight. |
 | `retry_after` value | Seconds left in the cooldown, rounded up (at least 1). Also sent as a `Retry-After` header. |
-| Breaker per route or per target? | Per route, since that's where the config lives. With load balancing it should become per target, so one bad target doesn't block healthy ones. |
+| Breaker per route or per target? | Per route, since that's where the config lives. Now that routes can have several targets, this has a cost: failures on one bad target count toward the route's breaker and can block the healthy targets too. Per-target breakers would fix that (see "What I'd build next"). |
 | Retry and breaker on the same route | Retry wraps the breaker. Each attempt counts as a separate breaker result, and once the breaker opens mid-retry, the remaining attempts stop instead of hammering a failing upstream. A breaker rejection is never retried. |
 
 ### Auth
@@ -186,6 +187,18 @@ The brief says ambiguities are intentional; these are the calls I made:
 | Auth before or after rate limiting? | After. If auth ran first, rejected requests would never reach the rate limiter, and someone could try keys as fast as the network allows. Now every failed guess uses up that client's budget. The trade-off: on a route with `per: "global"`, unauthenticated requests use up the shared budget too, so an attacker could crowd out legitimate users. A production version would add a separate limit on failed auth attempts. |
 | Do 401s count as circuit breaker failures? | No. Auth rejects before any upstream call, so the upstream's health isn't involved. |
 | Bypass with `..` through an open route | Not possible: paths are normalized first, so `/api/open/../internal` is routed (and authenticated) as `/api/internal`. |
+
+### Load balancing
+
+| Question | Decision |
+| --- | --- |
+| `round_robin` | Each target in turn. Weights are ignored, as the name suggests. |
+| `weighted_round_robin` | Smooth weighted round robin, the algorithm nginx uses. Each target gets exactly its share per cycle, spread out: weights 3:1 give A, A, B, A rather than A, A, A, B, so the lighter target is never idle for a long stretch and the heavier one never gets a burst. |
+| A single `url` | Treated as one target; no balancing logic runs. |
+| Concurrency | Picking a target is synchronous, so simultaneous requests can't race on the rotation: 40 requests at once at 3:1 split exactly 30/10. There's a test for this. |
+| Retry with several targets | The target is picked per attempt, so a retry goes to the next target in the rotation rather than back to the one that just failed. A dead target plus `retry` still gives the client a 200. |
+| A dead target, no retry | Until health checks exist, it stays in the rotation, so its share of requests gets 502. The balancer can already skip targets (`pick` takes a filter); health checks will supply the filter. |
+| Balancer state | Per route, in memory. The rotation restarts when the gateway restarts. |
 
 ### Rate limiting
 
@@ -238,15 +251,19 @@ The brief says ambiguities are intentional; these are the calls I made:
    default) and gave rejected requests (431, malformed HTTP) the same JSON error format as everything
    else. I also ran every command in the README in zsh, which found unquoted URLs that zsh rejects and
    two examples that auth had broken.
+10. **Load balancing.** `round_robin` and smooth `weighted_round_robin`, picked per attempt so retries
+    move to the next target. Checked with the example config: `/api/products` answers from
+    `products-a`, `products-a`, `products-b`, `products-a`, a 3:1 split.
 
 **Done and tested:** config loading and validation of the full schema, `/health`, routing, 404, 405,
 proxying (headers, body, query string, streaming), `strip_prefix`, per-route and global timeouts, 502/504
 handling, request IDs, access logs, graceful shutdown, retry with fixed/exponential backoff, circuit
 breaker, rate limiting (fixed and sliding window, per IP or global), path normalization, API key auth,
-request size limits (10 MB body, 16 KB request line + headers) with JSON errors.
+request size limits (10 MB body, 16 KB request line + headers) with JSON errors, load balancing
+(round robin and weighted).
 
-**Parsed and validated but not enforced yet:** load balancing (all traffic goes to the first
-target), health checks, request/response transforms. The gateway logs a startup warning for each.
+**Parsed and validated but not enforced yet:** health checks, request/response transforms. The gateway
+logs a startup warning for each.
 
 ## Testing approach
 
@@ -294,6 +311,8 @@ In order: the remaining features in the priority list above, then:
 - Streaming request bodies on routes that need neither retry nor body transforms.
 - Config hot reload (rebuild pipelines and swap the router atomically).
 - Metrics (request counts, latency histograms per route and upstream) alongside the access log.
+- Per-target circuit breakers, so one failing target doesn't trip the breaker for a route's healthy
+  targets.
 - More abuse protection: caps on risky config values (very large `retry.attempts`, or sliding-window
   `requests` that would use a lot of memory), a cap on simultaneous connections, tighter timeouts for
   slow-sending clients, grouping IPv6 clients by /64 for rate limiting, a separate limit on failed auth
