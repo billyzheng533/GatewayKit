@@ -16,7 +16,8 @@ commit history shows the same story step by step.
 - Static types for the config: every feature works with a normalized, typed config object instead of
   raw YAML.
 
-Dependencies are deliberately minimal: `yaml` at runtime; TypeScript, `tsx` and Vitest for development.
+Dependencies are deliberately minimal: `yaml` at runtime; TypeScript, `tsx`, Vitest and its coverage
+plugin for development.
 
 ## How I prioritized
 
@@ -32,7 +33,8 @@ same schema. So the order is:
    depends on. A gateway that gets these wrong is unusable regardless of what else it does.
 3. **An extensible pipeline**, so each later feature is a self-contained module rather than edits
    scattered across the server.
-4. **Then features, ordered by production value per hour of work** (planned):
+4. **Then features, ordered by production value per hour of work.** This was the plan; the actual order
+   changed as I went, and the build log under "Current state" says what happened and why:
    1. Rate limiting: protects upstreams, is configured on almost every route (via
       `global_rate_limit`), and is where the "50 simultaneous requests" concurrency question lives.
    2. Retry and circuit breaker: the resilience story ("what happens when an upstream is down?").
@@ -46,15 +48,20 @@ same schema. So the order is:
 ### Request flow
 
 ```text
-client → server.ts
+client → Node's HTTP parser               → 431 if request line + headers > 16 KB, 400 if malformed
+       → server.ts
+           ├─ normalizePath(path)         → 400 for ambiguous paths or ".." above "/"
            ├─ GET /health                 → 200 (built in, before routing)
            ├─ router.match(path)          → 404 if no route
            ├─ method allowed?             → 405 + Allow header if not
            ├─ read body (10 MB cap)       → 413 if larger
-           └─ route.handler(ctx)          ← composed once at startup:
-                 [feature middleware...] → upstream handler → UpstreamClient → upstream
+           └─ route.handler(ctx)          ← composed once at startup, per route:
+                 rate_limit (429) → auth (401) → retry → circuit_breaker (503)
+                   → upstream handler → UpstreamClient → upstream (502 unreachable, 504 timeout)
          ← response written once, by the server
 ```
+
+Each feature only appears in a route's pipeline if that route configures it.
 
 ### The pipeline (`src/pipeline.ts`, `src/features/index.ts`)
 
@@ -77,8 +84,9 @@ Key choices:
 - **Adding a feature** = parse its config in `config/load.ts`, write one module exporting a
   `Feature`, add it to the `FEATURES` list. The order of that list is the order of the pipeline
   (cheap rejections like auth and rate limiting first).
-- **Errors are typed.** Anything that should become a specific response throws a `GatewayError`
-  (status + machine-readable code). Upstream failures are distinct types (`UpstreamUnavailableError`
+- **Errors are typed.** Anything that should become a specific response is a `GatewayError`
+  (status + machine-readable code). Middleware that rejects a request outright (rate limiting, auth)
+  returns it as a response; failures deeper in the pipeline throw it. Upstream failures are distinct types (`UpstreamUnavailableError`
   → 502, `UpstreamTimeoutError` → 504), which retry and the circuit breaker can tell apart. Any other
   exception becomes a logged 500, never a crash.
 
@@ -94,7 +102,7 @@ Key choices:
 - **Unknown keys are warnings, not errors**: a typo like `strip_prefx` is flagged, but a config written
   for a newer version still loads.
 - **Configured-but-unimplemented features are logged at startup** for each route, so nobody assumes,
-  say, auth is enforced when it isn't.
+  say, health checks are running when they aren't.
 
 ### Proxying (`src/proxy/`)
 
@@ -111,8 +119,8 @@ Key choices:
   client sent it, so attempts are visible.
 - Every request gets an `X-Request-Id` (the client's, or a new UUID). It is forwarded upstream,
   returned to the client and included in log lines, so one request can be traced across services.
-- **Request bodies are buffered** (capped at 10 MB → 413). That's needed to replay a body on retry and
-  to rewrite it in `request_transform`. The trade-off is memory per in-flight request and no streaming
+- **Request bodies are buffered** (capped at 10 MB → 413). That's needed to replay a body on retry, and
+  will be needed to rewrite it in `request_transform`. The trade-off is memory per in-flight request and no streaming
   uploads; a production version would buffer only on routes that need it and stream otherwise.
 - **Request line and headers are capped at 16 KB** (431), which is where the query string lives. The
   limit is set explicitly on the server rather than inherited from Node's default, so it can't change
@@ -123,7 +131,8 @@ Key choices:
 - **Oversized bodies get a clean 413.** Stopping the read mid-upload resets the connection, and
   clients then report a broken pipe instead of the 413 (a test caught this). The gateway sends the 413
   and drains the rest of the body in the background, for at most 5 seconds.
-- **Response bodies stream** straight through to the client unless a feature needs to buffer them.
+- **Response bodies stream** straight through to the client; nothing buffers them yet (response
+  transforms would).
 - **Client disconnects cancel the upstream request** via an `AbortSignal`, so abandoned requests don't
   keep upstream work going.
 - **Graceful shutdown** on SIGINT/SIGTERM: stop accepting connections, let in-flight requests finish
@@ -222,11 +231,19 @@ The brief says ambiguities are intentional; these are the calls I made:
    checked in constant time, removed before forwarding, never logged, and checked after rate
    limiting so failed guesses are throttled. Checked with the example config, including the `..`
    path from step 6, which now gets a 401.
+8. **Filling test gaps with a coverage report.** Rather than guessing what was untested, I ran a
+   coverage report. It found about 20 untested validation branches, the startup warnings, and failure
+   paths in retry and the circuit breaker. Every feature now has success and failure tests.
+9. **Request limits.** Made the 16 KB request line + headers limit explicit (it had been Node's
+   default) and gave rejected requests (431, malformed HTTP) the same JSON error format as everything
+   else. I also ran every command in the README in zsh, which found unquoted URLs that zsh rejects and
+   two examples that auth had broken.
 
 **Done and tested:** config loading and validation of the full schema, `/health`, routing, 404, 405,
 proxying (headers, body, query string, streaming), `strip_prefix`, per-route and global timeouts, 502/504
 handling, request IDs, access logs, graceful shutdown, retry with fixed/exponential backoff, circuit
-breaker, rate limiting (fixed and sliding window, per IP or global), path normalization, API key auth.
+breaker, rate limiting (fixed and sliding window, per IP or global), path normalization, API key auth,
+request size limits (10 MB body, 16 KB request line + headers) with JSON errors.
 
 **Parsed and validated but not enforced yet:** load balancing (all traffic goes to the first
 target), health checks, request/response transforms. The gateway logs a startup warning for each.
@@ -240,19 +257,21 @@ stopping on client disconnect, all now covered. Line coverage is about 93%. The 
 `src/index.ts` (tested by running it as a separate process, which coverage can't see) and timing races
 that are hard to trigger on purpose.
 
-- **Unit tests** for pure logic: duration parsing, path matching and rewriting, config validation
-  (including the exact error messages for malformed configs), and the circuit breaker's state machine
-  and both rate limiting algorithms with a fake clock, so cooldowns and windows are tested without
-  waiting.
+- **Unit tests** for pure logic: duration parsing, config validation (including the exact error
+  messages for malformed configs), path matching, rewriting and normalization, proxy header handling,
+  API key comparison, startup warnings, and the circuit breaker's state machine and both rate limiting
+  algorithms with a fake clock, so cooldowns and windows are tested without waiting.
 - **Rate limiting end to end** (`test/rateLimit.test.ts`): 429s, headers, 50 simultaneous requests,
   window resets, inherited global limits. To get two client IPs from one machine, the per-IP and
   global tests connect over both IPv4 (127.0.0.1) and IPv6 (::1).
 - **Integration tests** that start real mock upstreams and a real gateway on random ports and talk
-  to them over HTTP. They cover the non-negotiables, header forwarding, 502/504, 50 concurrent
-  requests, retry (recovery, giving up, timeouts, backoff timing, no POST duplication) and the circuit
-  breaker opening, rejecting without calling the upstream, and recovering. `strip_prefix` has its own
-  file checking exactly what path and query string the upstream receives, including edge cases
-  (trailing slash, encoded characters, an upstream URL with a base path).
+  to them over HTTP. They build configs through the same YAML loader as production, with different
+  routes, ports and timeouts than `gateway.yaml`, which also exercises "works with any valid config".
+  They cover the non-negotiables, header forwarding, 502/504, 50 concurrent requests, retry (recovery,
+  giving up, timeouts, backoff timing, no POST duplication, client disconnects), the circuit breaker
+  (opening on 5xx, unreachable and timed-out upstreams; recovering), auth, and request size limits.
+  `strip_prefix` has its own file checking exactly what path and query string the upstream receives,
+  and `pathSecurity` sends raw `..` paths that try to escape a route.
 - **Failure tests** (`test/failures.test.ts`) cover how the gateway behaves when things break: an
   upstream that resets the connection, answers with non-HTTP bytes, dies halfway through a response,
   never answers, or restarts on the same port; 50 requests at once to a dead upstream; a client that
@@ -260,10 +279,10 @@ that are hard to trigger on purpose.
   gateway keeps serving afterwards.
 - **CLI tests** start the real `src/index.ts` as a separate process: config from an argument or
   `GATEWAY_CONFIG`, refusal to start on an invalid or missing config (exit 1), usage message (exit 2),
-  and a clean exit 0 on SIGTERM. They build configs through the same YAML loader as production and use different routes,
-  ports and timeouts than `gateway.yaml`, which also exercises "works with any valid config".
-- The mock upstream (`mock/upstream.ts`) echoes requests and has slow, flaky and fixed-status
-  endpoints for failure cases. `npm run mock` starts it on the example config's ports.
+  and a clean exit 0 on SIGTERM.
+- The mock upstream (`mock/upstream.ts`) echoes requests and has endpoints for failure cases: slow,
+  flaky, fixed status, dropped connection, truncated body and non-HTTP replies. `npm run mock` starts it
+  on the example config's ports.
 
 ## What I'd build next
 
@@ -274,6 +293,10 @@ In order: the remaining features in the priority list above, then:
 - Streaming request bodies on routes that need neither retry nor body transforms.
 - Config hot reload (rebuild pipelines and swap the router atomically).
 - Metrics (request counts, latency histograms per route and upstream) alongside the access log.
+- More abuse protection: caps on risky config values (very large `retry.attempts`, or sliding-window
+  `requests` that would use a lot of memory), a cap on simultaneous connections, tighter timeouts for
+  slow-sending clients, grouping IPv6 clients by /64 for rate limiting, a separate limit on failed auth
+  attempts, and truncating very long paths in logs.
 - An optional exact-match mode for routes (`match: "exact"`, defaulting to today's `"prefix"`). The
   schema only has prefix matching, which `strip_prefix` depends on, so I didn't add a field the spec
   doesn't define. But exposing only `/api/users` without everything under it currently isn't possible.
@@ -283,6 +306,6 @@ In order: the remaining features in the priority list above, then:
 
 I used Claude Code as a pair programmer: I shared the requirements and made decisions with Claude,
 working out the priorities and the architecture (pipeline of middleware, responses as values, validate
-everything up front), then had it draft code and tests in that order. I reviewed and ran everything it produced: type-checked,
-ran the tests, and smoke-tested the real gateway against the mock upstreams with `curl` before each
-commit.
+everything up front), then had it draft code and tests in that order. I reviewed and ran everything it
+produced: type-checked, ran the tests, and smoke-tested the real gateway against the mock upstreams with
+`curl` before each commit.

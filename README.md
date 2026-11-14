@@ -13,7 +13,7 @@ The design and the reasoning behind it are in [DECISIONS.md](DECISIONS.md).
 
 Runtime dependency: [`yaml`](https://www.npmjs.com/package/yaml) for parsing the config. The proxy, routing
 and HTTP handling use only Node's standard library. Dev dependencies: TypeScript, `tsx` (runs TypeScript
-directly) and Vitest (tests).
+directly), Vitest (tests) and `@vitest/coverage-v8` (coverage reports).
 
 ## Setup
 
@@ -33,9 +33,10 @@ npm start -- gateway.yaml
 GATEWAY_CONFIG=gateway.yaml npm start
 ```
 
-The gateway listens on `gateway.port` from the config (8080 in the example). It logs one JSON line per
-request to stdout, and warnings (unknown config keys, configured features that aren't implemented yet) to
-stderr at startup.
+The gateway listens on `gateway.port` from the config (8080 in the example). It logs JSON lines: one per
+request to stdout, and warnings to stderr. Warnings at startup cover unknown config keys and configured
+features that aren't implemented yet; at runtime they cover retries, circuit breaker changes, upstream
+failures and rejected malformed requests. Bodies, headers and query strings are never logged.
 
 If the config is malformed, the gateway refuses to start and lists every problem it found:
 
@@ -98,18 +99,11 @@ URLs are quoted throughout: in zsh (the macOS default shell), an unquoted `?` is
 the command fails with `no matches found`.
 
 **Retry:** `/api/orders` retries 503s with exponential backoff (1s, then 2s). This fails twice, then
-succeeds about 3 seconds later; the gateway's log shows each retry:
+succeeds about 3 seconds later; the gateway's log shows each retry. The mock counts failures per `key`,
+so change the key (or restart `npm run mock`) to see it again:
 
 ```bash
 curl -i "localhost:8080/api/orders/flaky?fail=2&key=demo"
-```
-
-**Circuit breaker:** `/api/internal` opens after 5 failures within 60s. Send 5 failing requests, and the
-6th is rejected with 503 `{"error":"service_unavailable","retry_after":30}` without reaching the upstream.
-The route also requires an API key, so the requests send one:
-
-```bash
-for i in 1 2 3 4 5 6; do curl -s -H 'X-API-Key: sk_live_abc123' "localhost:8080/api/internal/status/500"; echo; done
 ```
 
 **Auth:** `/api/internal` needs one of the configured keys in `X-API-Key`. Without one you get 401:
@@ -120,6 +114,15 @@ curl -i "localhost:8080/api/internal/stats"
 
 ```bash
 curl -i -H 'X-API-Key: sk_live_abc123' "localhost:8080/api/internal/stats"
+```
+
+**Circuit breaker:** `/api/internal` opens after 5 failures within 60s. Send 5 failing requests, and the
+6th is rejected with 503 `{"error":"service_unavailable","retry_after":30}` without reaching the upstream.
+The route also requires an API key, so the requests send one. After this, `/api/internal` answers 503 for
+30 seconds, then lets a trial request through:
+
+```bash
+for i in 1 2 3 4 5 6; do curl -s -H 'X-API-Key: sk_live_abc123' "localhost:8080/api/internal/status/500"; echo; done
 ```
 
 **Rate limiting:** `/api/orders` allows 10 requests per 10 seconds per client. The 11th and 12th get 429
@@ -139,9 +142,9 @@ npm test
 ```
 
 **It's self-contained.** You don't need to start the mock servers or the gateway, and nothing needs to be
-running on port 8080. Each test file starts its own mock upstream servers (`mock/upstream.ts`) and its own
-gateway, both on random free ports, and shuts them down afterwards. The CLI tests start the real gateway
-as a separate process. A full run takes about 2 seconds.
+running on port 8080. Each integration test file starts its own mock upstream servers (`mock/upstream.ts`)
+and its own gateway, both on random free ports, and shuts them down afterwards. The CLI tests start the
+real gateway as a separate process. A full run takes about 2 seconds.
 
 Type-check with `npm run typecheck`, re-run tests on every change with `npm run test:watch`, or see
 which lines are covered with `npm run coverage`.
@@ -214,11 +217,16 @@ src/
   index.ts            CLI entry point: load config, start server, graceful shutdown
   server.ts           HTTP server: /health, routing, 404/405, body reading, writing responses
   router.ts           Prefix matching and strip_prefix path rewriting
+  path.ts             Path normalization (resolving "..", rejecting ambiguous paths) before routing
   pipeline.ts         Request/response types and middleware composition
   errors.ts           GatewayError and the errors that map to 4xx/5xx responses
   logger.ts           JSON-lines logger
   config/             YAML loading, validation and normalized config types
-  features/           Feature registry: where per-route middleware (rate limit, retry, ...) plugs in
+  features/           Feature registry: where per-route middleware plugs in, in pipeline order:
+    rateLimit/          Fixed and sliding window limiters
+    auth/               API key check
+    retry/              Retry with backoff
+    circuitBreaker/     Breaker state machine and middleware
   proxy/              Upstream HTTP client, hop-by-hop header handling, terminal upstream handler
 mock/                 Mock upstream server (used by tests and `npm run mock`)
 test/                 Unit and integration tests
