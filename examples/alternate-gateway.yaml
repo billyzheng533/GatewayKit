@@ -1,0 +1,67 @@
+# examples/alternate-gateway.yaml
+#
+# A second config with the same schema as gateway.yaml but different values,
+# routes and feature combinations. It runs against the same mock upstreams:
+#
+#   npm run mock
+#   npm start -- examples/alternate-gateway.yaml
+#
+# test/alternateConfig.test.ts runs it end to end.
+
+x-json-api: &json-api            # shared settings, merged into routes below
+  methods: ["GET", "POST", "PUT", "DELETE"]
+  strip_prefix: true
+
+gateway:
+  port: 9090
+  global_timeout: "1m30s"
+  global_rate_limit:
+    requests: 500
+    window: "1m"
+    strategy: "sliding_window"
+    per: "global"
+
+routes:
+  # Catch-all: anything not matched below goes to the users service.
+  - path: "/"
+    methods: ["GET"]
+    upstream:
+      url: "http://localhost:3001"
+
+  - <<: *json-api
+    path: "/v2/catalog"
+    upstream:
+      targets:
+        - url: "http://localhost:3003"
+        - url: "http://localhost:3004"
+      balance: "round_robin"
+      timeout: "3s"
+    retry:
+      attempts: 4
+      backoff: "fixed"
+      initial_delay: "200ms"
+      on: [503]
+
+  - <<: *json-api
+    path: "/v2/catalog/admin"
+    upstream:
+      url: "http://localhost:3006"
+    auth:
+      type: "api_key"
+      header: "Authorization-Token"
+      keys: ["admin-token-1"]
+    rate_limit:
+      requests: 5
+      window: "30s"
+      strategy: "fixed_window"
+      per: "ip"
+
+  - path: "/billing"
+    methods: ["POST"]
+    upstream:
+      url: "http://localhost:3002"
+      timeout: "500ms"
+    circuit_breaker:
+      threshold: 2
+      window: "10s"
+      cooldown: "15s"

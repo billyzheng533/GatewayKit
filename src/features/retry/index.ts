@@ -1,4 +1,5 @@
 import { Readable } from 'node:stream';
+import { MAX_TIMER_MS } from '../../config/duration.js';
 import type { RetryConfig } from '../../config/types.js';
 import { UpstreamError, UpstreamUnavailableError } from '../../errors.js';
 import type { GatewayResponse, RequestContext } from '../../pipeline.js';
@@ -72,7 +73,9 @@ function shouldRetryError(config: RetryConfig, ctx: RequestContext, err: unknown
 
 /** Delay before the retry that follows failed attempt number `attempt` (1-based). */
 export function backoffDelay(config: RetryConfig, attempt: number): number {
-  return config.backoff === 'exponential' ? config.initialDelayMs * 2 ** (attempt - 1) : config.initialDelayMs;
+  const delay = config.backoff === 'exponential' ? config.initialDelayMs * 2 ** (attempt - 1) : config.initialDelayMs;
+  // Exponential growth can pass Node's timer limit, which would fire after 1 ms instead of waiting.
+  return Math.min(delay, MAX_TIMER_MS);
 }
 
 /** Drop a response we're not going to use, so its connection can be reused or closed. */

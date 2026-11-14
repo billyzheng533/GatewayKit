@@ -158,6 +158,11 @@ The brief says ambiguities are intentional; these are the calls I made:
 | Encoded slashes (`%2F`) in a path | 400. Some upstreams decode them into real slashes and some don't, so allowing them means the gateway and the upstream can disagree about which path was requested. |
 | Is `gateway.port` used? | Yes; it defaults to 8080 if missing. |
 | Unknown config keys | Warning, gateway still starts. Invalid values for known keys: startup fails. |
+| Settings that are valid alone but broken together | Rejected at startup, e.g. a route path like `/a/../b` that could never match a normalized request path, an upstream URL whose query string would be dropped, or `retry.on: []`. Settings that are legal but probably a mistake (weights with `round_robin`, `balance` with one `url`, a route at `/health`) only warn. |
+| How long can a duration be? | Durations that become timers (timeouts, retry delays, health check intervals) are capped at 24 days, Node's timer limit. Past it, Node fires the timer after 1 ms, so `timeout: "720h"` would have made every request time out instantly; I found this by probing and confirmed it. Exponential backoff is capped the same way. |
+| Duration formats | `"500ms"`, `"30s"`, `"1.5m"`, `"1h"`, and Go-style combinations like `"1m30s"`. A bare number is rejected rather than guessing the unit. |
+| Weights without `balance` | Weighted round robin. With equal weights it behaves exactly like round robin, so this only changes anything when weights are actually given. |
+| YAML features | Anchors with `<<:` merge keys are supported, since they're a common way to share route settings. Top-level keys starting with `x-` are allowed (no warning) as a place to define them. JSON files work too, since JSON is valid YAML. |
 
 ### Retry and circuit breaker
 
@@ -254,6 +259,12 @@ The brief says ambiguities are intentional; these are the calls I made:
 10. **Load balancing.** `round_robin` and smooth `weighted_round_robin`, picked per attempt so retries
     move to the next target. Checked with the example config: `/api/products` answers from
     `products-a`, `products-a`, `products-b`, `products-a`, a 3:1 split.
+11. **"Any valid config."** I probed the validator with config combinations rather than assuming it was
+    complete. That found settings that loaded but then misbehaved (a 30-day timeout that fired after
+    1 ms, route paths that could never match, upstream URLs whose query string was dropped), and valid
+    configs that were wrongly rejected (`"1m30s"`, YAML merge keys). All fixed, with a test matrix of
+    valid configs that must serve traffic, invalid combinations that must fail, and a second shipped
+    config (`examples/alternate-gateway.yaml`) run end to end.
 
 **Done and tested:** config loading and validation of the full schema, `/health`, routing, 404, 405,
 proxying (headers, body, query string, streaming), `strip_prefix`, per-route and global timeouts, 502/504
@@ -294,6 +305,9 @@ that are hard to trigger on purpose.
   never answers, or restarts on the same port; 50 requests at once to a dead upstream; a client that
   hangs up mid-request (the upstream request is cancelled) or mid-upload. Every test also checks the
   gateway keeps serving afterwards.
+- **Config combinations** (`test/configMatrix.test.ts`): differently shaped valid configs are loaded
+  and actually serve traffic; invalid combinations must fail with a specific error; suspicious ones
+  must warn. `test/alternateConfig.test.ts` runs a second shipped config end to end.
 - **CLI tests** start the real `src/index.ts` as a separate process: config from an argument or
   `GATEWAY_CONFIG`, refusal to start on an invalid or missing config (exit 1), usage message (exit 2),
   and a clean exit 0 on SIGTERM.

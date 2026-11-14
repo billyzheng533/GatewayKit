@@ -43,8 +43,36 @@ If the config is malformed, the gateway refuses to start and lists every problem
 ```text
 Invalid gateway config:
   - routes[0].path: must start with "/"
-  - routes[0].rate_limit.window: invalid duration "1 minute" (expected a number with a unit, e.g. "500ms", "30s", "5m", "1h")
+  - routes[0].rate_limit.window: invalid duration "1 minute" (expected a number with a unit, e.g. "500ms", "30s", "5m", "1h", "1m30s")
 ```
+
+### Config validation
+
+The gateway works with any config that follows the schema, not just `gateway.yaml`.
+[`examples/alternate-gateway.yaml`](examples/alternate-gateway.yaml) is a second config with different
+ports, routes and feature combinations; start it with `npm start -- examples/alternate-gateway.yaml`
+(it listens on 9090).
+
+Beyond checking each field's type, the loader rejects combinations that would load but then misbehave:
+
+| Rejected | Why |
+| --- | --- |
+| Both `url` and `targets`, or neither | A route needs exactly one way to reach its upstream |
+| A route `path` with `..`, `//`, `?`, `#`, `%2F`, or a backslash | Request paths are normalized before routing, so such a route could never match |
+| Two routes with the same path, including `/a` and `/a/` | Only one could ever be used |
+| An upstream URL with a query string, `#fragment` or `user:pass@` | They would be silently dropped |
+| A timeout, retry delay or health check interval over 24 days | Node can't wait that long; it would fire after 1 ms, timing out every request |
+| `retry.on: []` | Nothing would ever be retried |
+| An invalid header name (e.g. with a space), or a header value with a line break | It could never match, or it would inject extra headers |
+| Missing required settings (`rate_limit.window`, `circuit_breaker.cooldown`, `auth.keys`, ...) | The feature can't work without them |
+
+And it warns, but still starts, for settings that are legal but probably a mistake: target weights
+with `balance: round_robin` (ignored), `balance` with a single `url` (no effect), a route at `/health`
+(the built-in endpoint answers it), `port: 0` (any free port), and unknown keys (often typos).
+
+It also accepts common YAML forms: anchors with `<<:` merge keys (put shared blocks under a top-level key
+starting with `x-`), JSON files, lowercase methods, and Go-style durations like `"1m30s"`. When targets
+have weights but no `balance` is set, weighted round robin is used.
 
 ### Trying it against mock upstreams
 
@@ -274,6 +302,7 @@ Every implemented feature has tests for both what should work and what should fa
 | Feature | Success cases | Failure cases | Test files |
 | --- | --- | --- | --- |
 | Config loading | Example config, defaults for every optional field | YAML syntax errors, ~35 kinds of invalid field, missing file; every error listed with its location; unknown keys warned | `config`, `duration` |
+| Any valid config | 9 differently shaped configs start and serve traffic: no gateway section, no routes, catch-all only, nested prefixes, every feature at once, JSON, YAML anchors, Go-style durations; `examples/alternate-gateway.yaml` run end to end | 22 invalid combinations rejected with a specific error; 5 suspicious ones warned | `configMatrix`, `alternateConfig` |
 | Starting the gateway | Config from an argument or `GATEWAY_CONFIG`; exits 0 on SIGTERM | Invalid or missing config exits 1; no config exits 2 with usage | `cli` |
 | `/health` | 200 with integer uptime; HEAD; wins over a catch-all `/` route | 405 for other methods | `gateway` |
 | Routing and methods | Prefix match, most specific route wins, catch-all | 404 for no match or a partial prefix (`/api/usersX`); 405 with `Allow` | `router`, `gateway` |
@@ -351,5 +380,6 @@ src/
     circuitBreaker/     Breaker state machine and middleware
   proxy/              Upstream HTTP client, load balancer, hop-by-hop header handling, terminal upstream handler
 mock/                 Mock upstream server (used by tests and `npm run mock`)
+examples/             A second, different config, to show any valid config works
 test/                 Unit and integration tests
 ```

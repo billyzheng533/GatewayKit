@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { parse as parseYaml } from 'yaml';
-import { parseDuration } from './duration.js';
+import { normalizePath } from '../path.js';
+import { MAX_TIMER_MS, parseDuration } from './duration.js';
 import type {
   ApiKeyAuthConfig,
   CircuitBreakerConfig,
@@ -20,6 +21,8 @@ export const DEFAULT_PORT = 8080;
 export const DEFAULT_TIMEOUT_MS = 30_000;
 
 const HTTP_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
+/** A valid HTTP header name (RFC 9110 "token"). */
+const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 
 /** Thrown when the config can't be read or is invalid. Lists every problem, not just the first. */
 export class ConfigError extends Error {
@@ -48,7 +51,8 @@ export async function loadConfigFile(path: string): Promise<LoadedConfig> {
 export function parseConfig(yamlText: string): LoadedConfig {
   let raw: unknown;
   try {
-    raw = parseYaml(yamlText);
+    // merge: allow `<<: *anchor`, a common way to share settings between routes.
+    raw = parseYaml(yamlText, { merge: true });
   } catch (err) {
     throw new ConfigError([`YAML syntax error: ${(err as Error).message}`]);
   }
@@ -65,14 +69,18 @@ export function parseConfig(yamlText: string): LoadedConfig {
 export function validateConfig(raw: unknown): LoadedConfig {
   const v = new Validator();
   const root = v.mapping(raw, 'config');
-  v.knownKeys(root, 'config', ['gateway', 'routes']);
+  // Top-level keys starting with "x-" are allowed silently, as a home for YAML anchors.
+  v.knownKeys(root, 'config', ['gateway', 'routes'], { allowPrefix: 'x-' });
 
   const gateway = root.gateway === undefined ? {} : v.mapping(root.gateway, 'gateway');
   v.knownKeys(gateway, 'gateway', ['port', 'global_timeout', 'global_rate_limit']);
 
   const port = gateway.port === undefined ? DEFAULT_PORT : v.integer(gateway.port, 'gateway.port', 0, 65_535);
+  if (port === 0 && gateway.port === 0) v.warn('gateway.port: 0 means "any free port"; the actual port is logged at startup');
   const globalTimeoutMs =
-    gateway.global_timeout === undefined ? DEFAULT_TIMEOUT_MS : v.duration(gateway.global_timeout, 'gateway.global_timeout');
+    gateway.global_timeout === undefined
+      ? DEFAULT_TIMEOUT_MS
+      : v.duration(gateway.global_timeout, 'gateway.global_timeout', { timer: true });
   const globalRateLimit =
     gateway.global_rate_limit === undefined ? null : parseRateLimit(v, gateway.global_rate_limit, 'gateway.global_rate_limit');
 
@@ -116,7 +124,7 @@ function parseRoute(v: Validator, raw: unknown, at: string, defaults: RouteDefau
   v.knownKeys(r, at, ROUTE_KEYS);
 
   const path = normalizeRoutePath(v.string(r.path, `${at}.path`));
-  if (r.path !== undefined && !path.startsWith('/')) v.error(`${at}.path`, 'must start with "/"');
+  if (r.path !== undefined && path !== '') checkRoutePath(v, path, `${at}.path`);
 
   const methods = v.stringList(r.methods, `${at}.methods`, { nonEmpty: true }).map((m) => m.toUpperCase());
   methods.forEach((method, i) => {
@@ -145,8 +153,38 @@ function parseRoute(v: Validator, raw: unknown, at: string, defaults: RouteDefau
 
 /** "/api/users/" -> "/api/users"; "/" stays "/". */
 function normalizeRoutePath(path: string): string {
+  if (path.trim() === '') return '';
   const trimmed = path.trim().replace(/\/+$/, '');
   return trimmed === '' ? '/' : trimmed;
+}
+
+/**
+ * Request paths are normalized before routing (see src/path.ts), so a route
+ * path that isn't already in normalized form could never match anything.
+ * Reject it instead of starting with a dead route.
+ */
+function checkRoutePath(v: Validator, path: string, at: string): void {
+  if (!path.startsWith('/')) {
+    v.error(at, 'must start with "/"');
+    return;
+  }
+  if (path.includes('?') || path.includes('#')) {
+    v.error(at, 'must be a path only, without "?" or "#"; routes match on the path, never the query string');
+    return;
+  }
+  let normalized: string;
+  try {
+    normalized = normalizePath(path);
+  } catch {
+    v.error(at, 'must not contain encoded slashes (%2F, %5C), backslashes, null bytes, or ".." above "/"');
+    return;
+  }
+  if (normalized !== path) {
+    v.error(at, `must be written in normalized form ("${normalized}"): requests are normalized before routing, so "${path}" could never match`);
+  }
+  if (path === '/health') {
+    v.warn(`${at}: "/health" is answered by the gateway's built-in health endpoint, so this route only gets paths under /health/`);
+  }
 }
 
 function parseUpstream(v: Validator, raw: unknown, at: string, globalTimeoutMs: number): UpstreamConfig {
@@ -158,6 +196,7 @@ function parseUpstream(v: Validator, raw: unknown, at: string, globalTimeoutMs: 
     v.error(at, 'set either "url" or "targets", not both');
   } else if (u.url !== undefined) {
     targets = [{ url: v.httpUrl(u.url, `${at}.url`), weight: 1 }];
+    if (u.balance !== undefined) v.warn(`${at}.balance: has no effect with a single "url"; it applies to "targets"`);
   } else if (u.targets !== undefined) {
     const list = v.list(u.targets, `${at}.targets`);
     if (list.length === 0) v.error(`${at}.targets`, 'must contain at least one target');
@@ -174,11 +213,23 @@ function parseUpstream(v: Validator, raw: unknown, at: string, globalTimeoutMs: 
     v.error(at, 'must set "url" or "targets"');
   }
 
+  // Without an explicit `balance`, honor weights if any were given. With equal
+  // weights, weighted round robin behaves exactly like round robin anyway.
+  const anyWeight = Array.isArray(u.targets) && u.targets.some((t) => (t as Mapping | null)?.weight !== undefined);
+  const balance =
+    u.balance === undefined
+      ? anyWeight
+        ? 'weighted_round_robin'
+        : 'round_robin'
+      : v.oneOf(u.balance, `${at}.balance`, ['round_robin', 'weighted_round_robin']);
+  if (balance === 'round_robin' && u.balance !== undefined && targets.some((t) => t.weight !== 1)) {
+    v.warn(`${at}: target weights are ignored with balance "round_robin"; use "weighted_round_robin" to apply them`);
+  }
+
   return {
     targets,
-    balance:
-      u.balance === undefined ? 'round_robin' : v.oneOf(u.balance, `${at}.balance`, ['round_robin', 'weighted_round_robin']),
-    timeoutMs: u.timeout === undefined ? globalTimeoutMs : v.duration(u.timeout, `${at}.timeout`),
+    balance,
+    timeoutMs: u.timeout === undefined ? globalTimeoutMs : v.duration(u.timeout, `${at}.timeout`, { timer: true }),
   };
 }
 
@@ -200,9 +251,16 @@ function parseRetry(v: Validator, raw: unknown, at: string): RetryConfig {
   return {
     attempts: v.integer(r.attempts, `${at}.attempts`, 1),
     backoff: r.backoff === undefined ? 'fixed' : v.oneOf(r.backoff, `${at}.backoff`, ['fixed', 'exponential']),
-    initialDelayMs: r.initial_delay === undefined ? 100 : v.duration(r.initial_delay, `${at}.initial_delay`),
-    onStatus: r.on === undefined ? [502, 503, 504] : v.list(r.on, `${at}.on`).map((code, i) => v.integer(code, `${at}.on[${i}]`, 100, 599)),
+    initialDelayMs:
+      r.initial_delay === undefined ? 100 : v.duration(r.initial_delay, `${at}.initial_delay`, { timer: true }),
+    onStatus: r.on === undefined ? [502, 503, 504] : parseRetryOn(v, r.on, `${at}.on`),
   };
+}
+
+function parseRetryOn(v: Validator, raw: unknown, at: string): number[] {
+  const list = v.list(raw, at);
+  if (Array.isArray(raw) && list.length === 0) v.error(at, 'must not be empty: with no status codes, nothing would ever be retried');
+  return list.map((code, i) => v.integer(code, `${at}[${i}]`, 100, 599));
 }
 
 function parseHealthCheck(v: Validator, raw: unknown, at: string): HealthCheckConfig {
@@ -212,7 +270,7 @@ function parseHealthCheck(v: Validator, raw: unknown, at: string): HealthCheckCo
   if (h.path !== undefined && !path.startsWith('/')) v.error(`${at}.path`, 'must start with "/"');
   return {
     path,
-    intervalMs: h.interval === undefined ? 30_000 : v.duration(h.interval, `${at}.interval`),
+    intervalMs: h.interval === undefined ? 30_000 : v.duration(h.interval, `${at}.interval`, { timer: true }),
     unhealthyThreshold:
       h.unhealthy_threshold === undefined ? 3 : v.integer(h.unhealthy_threshold, `${at}.unhealthy_threshold`, 1),
   };
@@ -224,10 +282,13 @@ function parseHeaderTransform(v: Validator, raw: unknown, at: string): HeaderTra
   const add: Record<string, string> = {};
   if (h.add !== undefined) {
     for (const [name, value] of Object.entries(v.mapping(h.add, `${at}.add`))) {
-      add[name] = v.scalarString(value, `${at}.add.${name}`);
+      v.headerName(name, `${at}.add.${name}`);
+      add[name] = v.headerValue(v.scalarString(value, `${at}.add.${name}`), `${at}.add.${name}`);
     }
   }
-  return { add, remove: h.remove === undefined ? [] : v.stringList(h.remove, `${at}.remove`) };
+  const remove = h.remove === undefined ? [] : v.stringList(h.remove, `${at}.remove`);
+  remove.forEach((name, i) => v.headerName(name, `${at}.remove[${i}]`));
+  return { add, remove };
 }
 
 function parseRequestTransform(v: Validator, raw: unknown, at: string): RequestTransformConfig {
@@ -265,7 +326,7 @@ function parseAuth(v: Validator, raw: unknown, at: string): ApiKeyAuthConfig {
   v.knownKeys(a, at, ['type', 'header', 'keys']);
   return {
     type: v.oneOf(a.type, `${at}.type`, ['api_key']),
-    header: a.header === undefined ? 'X-API-Key' : v.string(a.header, `${at}.header`),
+    header: a.header === undefined ? 'X-API-Key' : v.headerName(v.string(a.header, `${at}.header`), `${at}.header`),
     keys: v.stringList(a.keys, `${at}.keys`, { nonEmpty: true }),
   };
 }
@@ -295,10 +356,23 @@ class Validator {
     this.warnings.push(message);
   }
 
-  knownKeys(obj: Mapping, at: string, allowed: string[]): void {
+  knownKeys(obj: Mapping, at: string, allowed: string[], opts: { allowPrefix?: string } = {}): void {
     for (const key of Object.keys(obj)) {
-      if (!allowed.includes(key)) this.warn(`${at}.${key}: unknown key (ignored)`);
+      if (allowed.includes(key) || (opts.allowPrefix && key.startsWith(opts.allowPrefix))) continue;
+      this.warn(`${at}.${key}: unknown key (ignored)`);
     }
+  }
+
+  /** Returns the name; records an issue if it isn't a valid HTTP header name. */
+  headerName(name: string, at: string): string {
+    if (name !== '' && !HEADER_NAME.test(name)) this.error(at, `"${name}" is not a valid HTTP header name`);
+    return name;
+  }
+
+  /** Header values must not contain line breaks: they would end the header and start another. */
+  headerValue(value: string, at: string): string {
+    if (/[\r\n\0]/.test(value)) this.error(at, 'must not contain line breaks or null bytes');
+    return value;
   }
 
   mapping(value: unknown, at: string): Mapping {
@@ -351,15 +425,22 @@ class Validator {
     return allowed[0] as T;
   }
 
-  duration(value: unknown, at: string): number {
+  /** `timer`: the value becomes a setTimeout delay, so it must fit Node's timer limit. */
+  duration(value: unknown, at: string, opts: { timer?: boolean } = {}): number {
     if (typeof value !== 'string') {
       this.error(at, value === undefined ? 'is required' : 'must be a duration string such as "30s"');
       return 1;
     }
     try {
       const ms = parseDuration(value);
-      if (ms > 0) return ms;
-      this.error(at, 'must be greater than zero');
+      if (ms <= 0) {
+        this.error(at, 'must be greater than zero');
+      } else if (opts.timer && ms > MAX_TIMER_MS) {
+        // Node fires longer timers after 1 ms, which would make every request time out at once.
+        this.error(at, `must be at most 24 days ("${value}" is longer than a Node timer can wait)`);
+      } else {
+        return ms;
+      }
     } catch (err) {
       this.error(at, (err as Error).message);
     }
@@ -372,8 +453,16 @@ class Validator {
     if (text === '') return placeholder;
     try {
       const url = new URL(text);
-      if (url.protocol === 'http:' || url.protocol === 'https:') return url;
-      this.error(at, `must be an http:// or https:// URL, got "${text}"`);
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+        this.error(at, `must be an http:// or https:// URL, got "${text}"`);
+      } else if (url.search || url.hash) {
+        // Request paths are appended to the URL's path; a query or fragment here would be silently dropped.
+        this.error(at, 'must not include a query string or "#fragment"; the client\'s own query string is forwarded');
+      } else if (url.username || url.password) {
+        this.error(at, 'must not include credentials ("user:pass@"); they would not be sent to the upstream');
+      } else {
+        return url;
+      }
     } catch {
       this.error(at, `is not a valid URL: "${text}"`);
     }
