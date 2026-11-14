@@ -60,21 +60,123 @@ Then start the gateway in another terminal and send it requests:
 npm start -- gateway.yaml
 ```
 
+Expected results are shown under each command. Headers that change on every run or don't matter here
+(`Date`, `Connection`, `Keep-Alive`, `Transfer-Encoding`) are left out, request IDs are random, and the
+mock's JSON echo is formatted across lines here; the gateway sends it on one line.
+
+**Health check.** The gateway answers this itself, without calling any upstream:
+
 ```bash
 curl -i "localhost:8080/health"
 ```
+
+```text
+HTTP/1.1 200 OK
+x-request-id: c7763db7-e676-4278-9010-985192d58b92
+content-type: application/json
+content-length: 39
+
+{"status":"healthy","uptime_seconds":1}
+```
+
+**Proxying.** Matches the `/api/users` route and is forwarded to the users mock on port 3001 with the path
+and query string unchanged (`strip_prefix: false`):
 
 ```bash
 curl -i "localhost:8080/api/users/42?expand=orders"
 ```
 
+```text
+HTTP/1.1 200 OK
+x-request-id: 3d21e56c-678d-4190-969d-7830b0dc8dfd
+server: mock-upstream/users
+x-powered-by: mock
+x-upstream: users
+content-type: application/json
+x-ratelimit-limit: 30
+x-ratelimit-remaining: 29
+x-ratelimit-reset: 60
+
+{
+  "upstream": "users",
+  "method": "GET",
+  "path": "/api/users/42",
+  "query": { "expand": "orders" },
+  "headers": {
+    "host": "localhost:3001",
+    "user-agent": "curl/8.7.1",
+    "accept": "*/*",
+    "x-forwarded-for": "::1",
+    "x-forwarded-host": "localhost:8080",
+    "x-forwarded-proto": "http",
+    "x-request-id": "3d21e56c-678d-4190-969d-7830b0dc8dfd",
+    "connection": "keep-alive"
+  },
+  "body": null
+}
+```
+
+What to notice:
+- `path` and `query` are what the upstream received. The body is the mock's echo of the request.
+- `x-ratelimit-*` comes from the route's limit of 30 requests per 60 seconds; `remaining` counts down
+  with each request.
+- The gateway added the `x-forwarded-*` and `x-request-id` headers and set `host` to the upstream.
+  `x-forwarded-for` is your address: `::1` over IPv6 or `127.0.0.1` over IPv4.
+- `server`, `x-powered-by` and `x-upstream` are the mock's own response headers, passed through.
+
+**strip_prefix.** Matches `/api/products`, which has `strip_prefix: true`, so the products mock receives
+`/123`:
+
 ```bash
 curl -i "localhost:8080/api/products/123"
 ```
 
+```text
+HTTP/1.1 200 OK
+x-request-id: 3dd001e9-dd13-4254-b9fa-0beaf7c2d569
+server: mock-upstream/products-a
+x-powered-by: mock
+x-upstream: products-a
+content-type: application/json
+x-ratelimit-limit: 100
+x-ratelimit-remaining: 99
+x-ratelimit-reset: 60
+
+{
+  "upstream": "products-a",
+  "method": "GET",
+  "path": "/123",
+  "query": {},
+  "headers": { "host": "localhost:3003", ... },
+  "body": null
+}
+```
+
+What to notice:
+- `"path": "/123"`: the `/api/products` prefix was stripped.
+- `x-upstream: products-a`: load balancing isn't built yet, so every request goes to the route's first
+  target (port 3003), never `products-b`.
+- The limit is 100 per 60 seconds, inherited from `global_rate_limit`, because this route doesn't set
+  its own.
+
+**Method filtering.** `/api/products` only allows GET, so a POST is rejected before reaching any
+upstream:
+
 ```bash
 curl -i -X POST "localhost:8080/api/products"
 ```
+
+```text
+HTTP/1.1 405 Method Not Allowed
+x-request-id: d01c480d-1434-4dc1-93db-510b1bfc2641
+allow: GET
+content-type: application/json
+content-length: 79
+
+{"error":"method_not_allowed","message":"POST is not allowed on /api/products"}
+```
+
+The `allow` header lists the methods the route accepts.
 
 The mock echoes each request back as JSON (method, path, query, headers, body), so you can see exactly what
 the gateway forwarded. It also has endpoints for failure cases, under any path prefix:
