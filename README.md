@@ -134,24 +134,29 @@ running on port 8080. Each test file starts its own mock upstream servers (`mock
 gateway, both on random free ports, and shuts them down afterwards. The CLI tests start the real gateway
 as a separate process. A full run takes about 2 seconds.
 
-Type-check with `npm run typecheck`, or re-run tests on every change with `npm run test:watch`.
+Type-check with `npm run typecheck`, re-run tests on every change with `npm run test:watch`, or see
+which lines are covered with `npm run coverage`.
 
-| File | Kind | What it covers |
-| --- | --- | --- |
-| `test/config.test.ts` | Unit | Loading `gateway.yaml`, defaults, and rejecting malformed configs with every error listed |
-| `test/duration.test.ts` | Unit | Duration strings (`"500ms"`, `"30s"`, ...) and invalid ones |
-| `test/router.test.ts` | Unit | Prefix matching, most-specific-route wins, path rewriting |
-| `test/path.test.ts` | Unit | Path normalization: dot-segments, encoded dots, rejected paths |
-| `test/circuitBreaker.test.ts` | Unit | Breaker state machine with a fake clock: opening, cooldown, half-open trial |
-| `test/limiters.test.ts` | Unit | Fixed and sliding window algorithms with a fake clock |
-| `test/gateway.test.ts` | Integration | `/health`, proxying, 404, 405, headers, 502, 504, 413, 50 concurrent requests |
-| `test/stripPrefix.test.ts` | Integration | Exactly which path and query string the upstream receives |
-| `test/pathSecurity.test.ts` | Integration | `..` tricks that try to escape a route's prefix, sent raw so the client can't tidy them up |
-| `test/resilience.test.ts` | Integration | Retry (recovery, giving up, backoff, no duplicate POSTs) and circuit breaker |
-| `test/auth.test.ts` | Unit + integration | Valid and invalid keys, key not forwarded, duplicate headers, `..` tricks, failed guesses hitting the rate limit |
-| `test/rateLimit.test.ts` | Integration | 429s and headers, 50 simultaneous requests, window resets, per IP vs. global, inherited limits |
-| `test/failures.test.ts` | Integration | Upstreams that reset, send garbage, die mid-response, hang, or restart; clients that disconnect |
-| `test/cli.test.ts` | Integration | Starting the real gateway: config from an argument or `GATEWAY_CONFIG`, bad config exits 1, SIGTERM exits 0 |
+Every implemented feature has tests for both what should work and what should fail:
+
+| Feature | Success cases | Failure cases | Test files |
+| --- | --- | --- | --- |
+| Config loading | Example config, defaults for every optional field | YAML syntax errors, ~35 kinds of invalid field, missing file; every error listed with its location; unknown keys warned | `config`, `duration` |
+| Starting the gateway | Config from an argument or `GATEWAY_CONFIG`; exits 0 on SIGTERM | Invalid or missing config exits 1; no config exits 2 with usage | `cli` |
+| `/health` | 200 with integer uptime; HEAD; wins over a catch-all `/` route | 405 for other methods | `gateway` |
+| Routing and methods | Prefix match, most specific route wins, catch-all | 404 for no match or a partial prefix (`/api/usersX`); 405 with `Allow` | `router`, `gateway` |
+| Path normalization | `.`, `..` and `%2e%2e` resolved; repeated slashes collapsed | 400 for climbing above `/`, `%2F`, `%5C`, `\`, `%00`; prefix-escape attempts | `path`, `pathSecurity` |
+| Proxying | Method, path, query, body and headers forwarded; `X-Forwarded-*`; request IDs; 50 concurrent requests | Hop-by-hop headers dropped; 413 for oversized bodies; upstream reset or non-HTTP reply gives 502; upstream dying mid-response; client disconnects; an internal bug gives 500 and the gateway keeps serving | `headers`, `gateway`, `failures` |
+| `strip_prefix` | Nested paths, bare prefix, query kept, upstream base path, `false` keeps path | No stripping on a partial prefix | `stripPrefix` |
+| Timeouts | Route and global timeouts | 504 for a slow or hanging upstream, without waiting for it | `gateway`, `failures` |
+| Retry | Recovers after failures; fixed and exponential timing; PUT retried with its body | Gives up after `attempts`; statuses not in `on` not retried; POST not duplicated; stops when the client disconnects | `resilience`, `resilienceFailures` |
+| Circuit breaker | Stays closed on success and 4xx; recovers through a half-open trial | Opens on 5xx, unreachable and timed-out upstreams; failed trial re-opens; 401s don't count | `circuitBreaker`, `resilience`, `resilienceFailures`, `failures`, `auth` |
+| Rate limiting | Admits the limit; headers; windows reset; inherited global limit | 429 with `retry_after`; 50 simultaneous requests against a limit of 10; fake `X-Forwarded-For` ignored; per IP vs. global | `limiters`, `rateLimit` |
+| Auth | Every configured key; custom header name; key not forwarded | Missing, wrong, empty, partial, wrong-case and duplicate keys; `..` bypass attempt; failed guesses rate limited | `auth` |
+| Startup warnings | Silent for implemented features | Warns for each configured feature that isn't built yet | `features` |
+
+Files are in `test/` and named `<name>.test.ts`. Unit tests use a fake clock where time matters, so
+windows and cooldowns are tested without waiting. Integration tests talk to a real gateway over HTTP.
 
 ## Config feature checklist
 

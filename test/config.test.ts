@@ -134,3 +134,116 @@ routes:
     await expect(loadConfigFile('does-not-exist.yaml')).rejects.toThrow(/cannot read config file "does-not-exist.yaml"/);
   });
 });
+
+/** Builds a one-route config (YAML accepts JSON) with fields overridden or removed (undefined). */
+const BASE_ROUTE = { path: '/a', methods: ['GET'], upstream: { url: 'http://localhost:9000' } };
+const routeConfig = (overrides: Record<string, unknown>) => JSON.stringify({ routes: [{ ...BASE_ROUTE, ...overrides }] });
+
+describe('rejecting each kind of invalid field', () => {
+  it.each<[string, Record<string, unknown>, string]>([
+    ['missing path', { path: undefined }, 'routes[0].path: is required'],
+    ['empty path', { path: '' }, 'routes[0].path: must be a non-empty string'],
+    ['methods not a list', { methods: 'GET' }, 'routes[0].methods: must be a list'],
+    ['missing methods', { methods: undefined }, 'routes[0].methods: is required'],
+    ['strip_prefix not a boolean', { strip_prefix: 'yes' }, 'routes[0].strip_prefix: must be true or false'],
+    ['missing upstream', { upstream: undefined }, 'routes[0].upstream: is required'],
+    ['empty upstream url', { upstream: { url: '' } }, 'routes[0].upstream.url: must be a non-empty string'],
+    ['malformed upstream url', { upstream: { url: 'not a url' } }, 'routes[0].upstream.url: is not a valid URL: "not a url"'],
+    ['empty targets list', { upstream: { targets: [] } }, 'routes[0].upstream.targets: must contain at least one target'],
+    [
+      'target weight below 1',
+      { upstream: { targets: [{ url: 'http://x', weight: 0 }] } },
+      'routes[0].upstream.targets[0].weight: must be an integer >= 1',
+    ],
+    [
+      'unknown balance strategy',
+      { upstream: { url: 'http://x', balance: 'random' } },
+      'routes[0].upstream.balance: must be one of "round_robin", "weighted_round_robin"',
+    ],
+    ['zero timeout', { upstream: { url: 'http://x', timeout: '0s' } }, 'routes[0].upstream.timeout: must be greater than zero'],
+    ['rate limit without requests', { rate_limit: { window: '1s' } }, 'routes[0].rate_limit.requests: is required'],
+    ['rate limit without window', { rate_limit: { requests: 1 } }, 'routes[0].rate_limit.window: is required'],
+    [
+      'numeric window',
+      { rate_limit: { requests: 1, window: 30 } },
+      'routes[0].rate_limit.window: must be a duration string such as "30s"',
+    ],
+    [
+      'unknown rate limit key',
+      { rate_limit: { requests: 1, window: '1s', per: 'user' } },
+      'routes[0].rate_limit.per: must be one of "ip", "global"',
+    ],
+    ['retry attempts below 1', { retry: { attempts: 0 } }, 'routes[0].retry.attempts: must be an integer >= 1'],
+    ['unknown backoff', { retry: { attempts: 2, backoff: 'linear' } }, 'routes[0].retry.backoff: must be one of "fixed", "exponential"'],
+    ['retry.on not a list', { retry: { attempts: 2, on: 503 } }, 'routes[0].retry.on: must be a list'],
+    [
+      'retry.on with a non-HTTP status',
+      { retry: { attempts: 2, on: [700] } },
+      'routes[0].retry.on[0]: must be an integer between 100 and 599',
+    ],
+    ['health check path without "/"', { health_check: { path: 'healthz' } }, 'routes[0].health_check.path: must start with "/"'],
+    [
+      'header value that is not a string',
+      { request_transform: { headers: { add: { 'X-A': { nested: true } } } } },
+      'routes[0].request_transform.headers.add.X-A: must be a string',
+    ],
+    [
+      'body mapping source that is not a string',
+      { request_transform: { body: { mapping: { 'user.id': 5 } } } },
+      'routes[0].request_transform.body.mapping.user.id: must be a non-empty string',
+    ],
+    [
+      'envelope that is not a mapping',
+      { response_transform: { body: { envelope: 'data' } } },
+      'routes[0].response_transform.body.envelope: must be a mapping',
+    ],
+    ['unknown auth type', { auth: { type: 'oauth', keys: ['k'] } }, 'routes[0].auth.type: must be one of "api_key"'],
+    ['auth without keys', { auth: { type: 'api_key' } }, 'routes[0].auth.keys: is required'],
+    ['auth with an empty key list', { auth: { type: 'api_key', keys: [] } }, 'routes[0].auth.keys: must not be empty'],
+    ['circuit breaker without threshold', { circuit_breaker: { window: '1s', cooldown: '1s' } }, 'routes[0].circuit_breaker.threshold: is required'],
+    [
+      'circuit breaker with an invalid cooldown',
+      { circuit_breaker: { threshold: 1, window: '1s', cooldown: 'forever' } },
+      'routes[0].circuit_breaker.cooldown: invalid duration "forever"',
+    ],
+  ])('%s', (_label, overrides, expected) => {
+    const issues = issuesOf(routeConfig(overrides));
+    expect(issues.some((issue) => issue.startsWith(expected))).toBe(true);
+  });
+
+  it.each<[string, string, string]>([
+    ['an empty file', '', 'config: must be a mapping'],
+    ['a top-level list', '- a\n- b', 'config: must be a mapping'],
+    ['gateway that is not a mapping', 'gateway: "fast"', 'gateway: must be a mapping'],
+    ['routes that is not a list', 'routes: { path: "/a" }', 'routes: must be a list'],
+    ['a route that is not a mapping', 'routes: ["/a"]', 'routes[0]: must be a mapping'],
+  ])('rejects %s', (_label, yaml, expected) => {
+    expect(issuesOf(yaml)).toContain(expected);
+  });
+});
+
+describe('defaults for optional feature settings', () => {
+  it('fills in retry, health check, auth, target weight and header value defaults', () => {
+    const { config } = parseConfig(
+      routeConfig({
+        upstream: { targets: [{ url: 'http://a' }, { url: 'http://b', weight: 2 }] },
+        retry: { attempts: 2 },
+        health_check: { path: '/healthz' },
+        auth: { type: 'api_key', keys: ['k'] },
+        request_transform: { headers: { add: { 'X-Version': 2, 'X-Flag': true } } },
+      }),
+    );
+    const route = config.routes[0];
+    expect(route?.upstream.targets.map((t) => t.weight)).toEqual([1, 2]);
+    expect(route?.retry).toEqual({ attempts: 2, backoff: 'fixed', initialDelayMs: 100, onStatus: [502, 503, 504] });
+    expect(route?.healthCheck).toEqual({ path: '/healthz', intervalMs: 30_000, unhealthyThreshold: 3 });
+    expect(route?.auth?.header).toBe('X-API-Key');
+    expect(route?.requestTransform?.headers?.add).toEqual({ 'X-Version': '2', 'X-Flag': 'true' });
+  });
+
+  it('warns when there are no routes', () => {
+    expect(parseConfig('gateway: { port: 8080 }').warnings).toEqual([
+      'routes: no routes configured; every request except /health will return 404',
+    ]);
+  });
+});

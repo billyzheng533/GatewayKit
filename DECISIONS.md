@@ -227,6 +227,13 @@ target), health checks, request/response transforms. The gateway logs a startup 
 
 ## Testing approach
 
+Every implemented feature has tests for what should succeed and for what should fail; the README has
+the full table. I used a coverage report (`npm run coverage`) to find gaps rather than guessing: it
+turned up untested validation branches, the circuit breaker counting unreachable upstreams, and retry
+stopping on client disconnect, all now covered. Line coverage is about 93%. The remainder is mostly
+`src/index.ts` (tested by running it as a separate process, which coverage can't see) and timing races
+that are hard to trigger on purpose.
+
 - **Unit tests** for pure logic: duration parsing, path matching and rewriting, config validation
   (including the exact error messages for malformed configs), and the circuit breaker's state machine
   and both rate limiting algorithms with a fake clock, so cooldowns and windows are tested without

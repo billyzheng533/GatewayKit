@@ -1,6 +1,7 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { UpstreamClient } from '../src/proxy/client.js';
 import type { RunningGateway } from '../src/server.js';
 import { startMockUpstream, type MockUpstream } from '../mock/upstream.js';
 import { closedPort, startTestGateway } from './helpers.js';
@@ -158,3 +159,17 @@ async function freePort(): Promise<number> {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   return port;
 }
+
+describe('gateway bugs', () => {
+  it('turns an unexpected internal error into a 500 and keeps serving', async () => {
+    const spy = vi.spyOn(UpstreamClient.prototype, 'send').mockRejectedValueOnce(new Error('simulated bug'));
+    try {
+      const res = await send('/api/svc/anything');
+      expect(res.status).toBe(500);
+      expect(await res.json()).toEqual({ error: 'internal_error', message: 'internal gateway error' });
+    } finally {
+      spy.mockRestore();
+    }
+    await expectStillServing();
+  });
+});

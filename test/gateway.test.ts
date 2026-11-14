@@ -225,6 +225,12 @@ describe('request limits and header hygiene', () => {
     expect(headers['keep-alive']).toBeUndefined();
   });
 
+  it('rejects methods other than GET and HEAD on /health with 405', async () => {
+    const res = await get('/health', { method: 'POST' });
+    expect(res.status).toBe(405);
+    expect(res.headers.get('allow')).toBe('GET, HEAD');
+  });
+
   it('answers HEAD /health', async () => {
     const res = await get('/health', { method: 'HEAD' });
     expect(res.status).toBe(200);
