@@ -131,6 +131,11 @@ Key choices:
 ### Proxying (`src/proxy/`)
 
 - Node's `http`/`https` client with keep-alive agents shared across routes (connection reuse).
+  `https://` upstreams have their certificates verified (502 if untrusted). A private CA is added with
+  Node's standard `NODE_EXTRA_CA_CERTS`, rather than a config option to turn verification off, which
+  would be one typo away from accepting any certificate.
+- Redirects and every `Set-Cookie` from the upstream are passed to the client unchanged. Following
+  redirects is the client's decision, not the gateway's.
 - Hop-by-hop headers (`Connection`, `Transfer-Encoding`, ... and anything named in `Connection`) are
   dropped in both directions; `X-Forwarded-For/Host/Proto` are added; `Host` is set to the upstream.
 - **Paths are normalized before routing** (`src/path.ts`). Without this, `/api/products/../internal`
@@ -350,6 +355,14 @@ The brief says ambiguities are intentional; these are the calls I made:
     requests, rate limit cleanup scanning every client inside one request, missing rate limit headers
     on 502s, health check rounds that could crash the process on an unexpected error, and three bits
     of duplicated logic.
+14. **Hardening the tests.** Checked every feature for unit and integration tests of both success and
+    failure. That added tests for retry's rules per method and failure type, the error types, the
+    pipeline order and logger, HTTPS upstreams (trusted and untrusted certificates), graceful
+    shutdown with a request in flight, and proxy details (hop-by-hop response headers, 5 MB streaming,
+    `Set-Cookie`, redirects, HEAD). One new test found a bug: a connection error with an empty message
+    produced a 502 ending in a blank. To check the tests catch real bugs, I injected 8 (an off-by-one
+    rate limit, POST treated as idempotent, the router ignoring segment boundaries, auth accepting a
+    doubled header, and others) into a copy of the code; the suite caught every one.
 
 ### Done and tested
 
@@ -376,14 +389,20 @@ active health checks.
 Every implemented feature has tests for what should succeed and for what should fail; the README has
 the full table. I used a coverage report (`npm run coverage`) to find gaps rather than guessing: it
 turned up untested validation branches, the circuit breaker counting unreachable upstreams, and retry
-stopping on client disconnect, all now covered. Line coverage is about 93%. The remainder is mostly
+stopping on client disconnect, all now covered. Line coverage is about 95%. The remainder is mostly
 `src/index.ts` (tested by running it as a separate process, which coverage can't see) and timing races
 that are hard to trigger on purpose.
 
+Passing tests only matter if they fail when the code is wrong, so I checked that too: 8 deliberate bugs
+injected into a copy of the code (off-by-one limits, wrong retry rules, a router that ignores segment
+boundaries, an auth check that accepts a doubled header, and so on) were each caught by the suite.
+
 - **Unit tests** for pure logic: duration parsing, config validation (including the exact error
   messages for malformed configs), path matching, rewriting and normalization, proxy header handling,
-  API key comparison, startup warnings, and the circuit breaker's state machine and both rate limiting
-  algorithms with a fake clock, so cooldowns and windows are tested without waiting.
+  API key comparison, startup warnings, error types and their response bodies, connection error
+  descriptions, the pipeline order, the logger, retry's decision rules for every method and failure
+  type, and the circuit breaker's state machine and both rate limiting algorithms with a fake clock,
+  so cooldowns and windows are tested without waiting.
 - **Rate limiting end to end** (`test/rateLimit.test.ts`): 429s, headers, 50 simultaneous requests,
   window resets, inherited global limits. To get two client IPs from one machine, the per-IP and
   global tests connect over both IPv4 (127.0.0.1) and IPv6 (::1).
@@ -394,7 +413,10 @@ that are hard to trigger on purpose.
   giving up, timeouts, backoff timing, no POST duplication, client disconnects), the circuit breaker
   (opening on 5xx, unreachable and timed-out upstreams; recovering), auth, and request size limits.
   `strip_prefix` has its own file checking exactly what path and query string the upstream receives,
-  and `pathSecurity` sends raw `..` paths that try to escape a route.
+  and `pathSecurity` sends raw `..` paths that try to escape a route. `proxyBehavior` uses a purpose-built
+  upstream for what the echo mock can't do (hop-by-hop response headers, a 5 MB streamed body,
+  `Set-Cookie`, redirects, HEAD) and graceful shutdown with a request in flight. `https` covers HTTPS
+  upstreams with a self-signed test certificate: refused when untrusted, proxied once trusted.
 - **Load balancing and health checks** (`balancer`, `loadBalancing`, `healthCheck`, `healthCheckRouting`):
   exact pick order, 40 simultaneous requests splitting exactly 30/10, retries moving to the next target,
   and unhealthy targets leaving and rejoining the rotation, with real checks every 50ms.

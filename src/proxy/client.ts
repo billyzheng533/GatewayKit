@@ -106,5 +106,6 @@ export function describeConnectError(err: Error): { error: Error; code?: string 
   if (code && message) {
     return { error: new Error(message.includes(code) ? message : `${code}: ${message}`, { cause: err }), code };
   }
-  return { error: new Error(code ?? message ?? 'connection failed', { cause: err }), code };
+  // `||`, not `??`: an empty message is as useless as a missing one.
+  return { error: new Error(code || message || 'connection failed', { cause: err }), code };
 }

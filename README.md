@@ -320,10 +320,13 @@ Every implemented feature has tests for both what should work and what should fa
 | Path normalization | `.`, `..` and `%2e%2e` resolved; repeated slashes collapsed | 400 for climbing above `/`, `%2F`, `%5C`, `\`, `%00`; prefix-escape attempts | `path`, `pathSecurity` |
 | Request limits | A long query string within 16 KB is forwarded unchanged | 431 for an oversized query string, header or set of headers; 400 for malformed HTTP; neither reaches the upstream | `requestLimits` |
 | Request handling | A forwarded request gets its full body; a well-formed client `X-Request-Id` is kept | Auth and rate limiting reject large uploads without waiting for the body; client hang-ups mid-upload log nothing; unsafe request IDs replaced; 502s keep rate limit headers | `requestHandling`, `time` |
-| Proxying | Method, path, query, body and headers forwarded; `X-Forwarded-*`; request IDs; 50 concurrent requests | Hop-by-hop headers dropped; 413 for oversized bodies; upstream reset or non-HTTP reply gives 502; upstream dying mid-response; client disconnects; an internal bug gives 500 and the gateway keeps serving | `headers`, `gateway`, `failures` |
+| Proxying | Method, path, query, body and headers forwarded; `X-Forwarded-*`; request IDs; 50 concurrent requests; a 5 MB response streamed intact; HEAD; redirects and every `Set-Cookie` passed through unchanged | Hop-by-hop headers dropped in both directions; 413 for oversized bodies; upstream reset or non-HTTP reply gives 502; upstream dying mid-response; client disconnects; an internal bug gives 500 and the gateway keeps serving | `headers`, `gateway`, `failures`, `proxyBehavior`, `errors` |
 | `strip_prefix` | Nested paths, bare prefix, query kept, upstream base path, `false` keeps path | No stripping on a partial prefix | `stripPrefix` |
 | Timeouts | Route and global timeouts | 504 for a slow or hanging upstream, without waiting for it | `gateway`, `failures` |
-| Retry | Recovers after failures; fixed and exponential timing; PUT retried with its body | Gives up after `attempts`; statuses not in `on` not retried; POST not duplicated; stops when the client disconnects | `resilience`, `resilienceFailures` |
+| Retry | Recovers after failures; fixed and exponential timing; GET, HEAD, OPTIONS, PUT and DELETE retried, PUT with its body | Gives up after `attempts`; statuses not in `on` not retried; POST and PATCH not retried once the upstream may have seen them (after a 503, a reset or a timeout), only when the connection was refused; gateway decisions never retried; stops when the client disconnects | `retryRules`, `resilience`, `resilienceFailures` |
+| HTTPS upstreams | Proxies to an `https://` upstream whose certificate is trusted (`NODE_EXTRA_CA_CERTS`) | Refuses an upstream with an untrusted certificate (502) | `https` |
+| Graceful shutdown | A request already in flight finishes when the gateway stops | New connections are refused after shutdown | `proxyBehavior`, `cli` |
+| Pipeline and logging | Middleware run in order (rate limit, auth, retry, circuit breaker); only configured features run; JSON log lines go to stdout (info) and stderr (warn, error) | A middleware can answer without calling the rest | `pipeline` |
 | Circuit breaker | Stays closed on success and 4xx; recovers through a half-open trial | Opens on 5xx, unreachable and timed-out upstreams; failed trial re-opens; 401s don't count | `circuitBreaker`, `resilience`, `resilienceFailures`, `failures`, `auth` |
 | Health checks | Checks the configured path on every target; a failing target is taken out of rotation after `unhealthy_threshold` checks and put back after one success | Down, failing and too-slow targets are skipped; 503 without any upstream call when no target is healthy; each failure has a reason, and a 404/405 hints at a wrong `health_check.path`; checks stop on shutdown; failure count resets on success | `healthCheck`, `healthCheckRouting` |
 | Load balancing | Round robin; weighted 3:1 spread out (A, A, B, A); 40 simultaneous requests split exactly 30/10; `strip_prefix` on every target | A retried attempt moves to the next target; a dead target gives 502 only for its share; all targets down gives 502 | `balancer`, `loadBalancing` |
@@ -334,6 +337,18 @@ Every implemented feature has tests for both what should work and what should fa
 
 Files are in `test/` and named `<name>.test.ts`. Unit tests use a fake clock where time matters, so
 windows and cooldowns are tested without waiting. Integration tests talk to a real gateway over HTTP.
+
+## HTTPS upstreams
+
+`upstream.url` (or a target's `url`) can be `https://`. The gateway verifies the upstream's certificate
+and answers 502 if it isn't trusted. For an upstream with a private or self-signed certificate, add
+its CA when starting the gateway (Node's standard setting):
+
+```bash
+NODE_EXTRA_CA_CERTS=path/to/ca.pem npm start -- gateway.yaml
+```
+
+`test/fixtures/tls` holds a self-signed certificate for `localhost`, used only by the tests.
 
 ## Request limits
 
@@ -360,6 +375,7 @@ None of these requests reach an upstream.
 | `methods` filtering, 405 with `Allow` header | ✅ |
 | Path normalization: `..`/`%2e%2e` resolved before routing; encoded slashes, backslashes and climbing above `/` rejected (400) | ✅ |
 | Proxying (method, path, query, headers, body; streamed responses) | ✅ |
+| `https://` upstreams (certificates verified; trust a private CA with `NODE_EXTRA_CA_CERTS`) | ✅ |
 | `strip_prefix` | ✅ |
 | `global_timeout` / `upstream.timeout` (504 on timeout, 502 when unreachable) | ✅ |
 | `global_rate_limit` / `rate_limit` (`fixed_window`, `sliding_window`, `per: ip / global`) | ✅ |
@@ -385,6 +401,7 @@ src/
   pipeline.ts         Request/response types and middleware composition
   errors.ts           GatewayError and the errors that map to 4xx/5xx responses
   logger.ts           JSON-lines logger
+  time.ts             Rounding durations to whole seconds (Retry-After, retry_after)
   config/             YAML loading, validation and normalized config types
   features/           Feature registry: where per-route middleware plugs in, in pipeline order:
     rateLimit/          Fixed and sliding window limiters
@@ -395,5 +412,5 @@ src/
                       terminal upstream handler
 mock/                 Mock upstream server (used by tests and `npm run mock`)
 examples/             A second, different config, to show any valid config works
-test/                 Unit and integration tests
+test/                 Unit and integration tests (fixtures/tls: a self-signed cert for HTTPS tests)
 ```
