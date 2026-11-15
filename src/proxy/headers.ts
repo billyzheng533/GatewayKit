@@ -31,19 +31,31 @@ export function withoutHopByHop(headers: IncomingHttpHeaders): Record<string, st
 
 export interface ForwardingInfo {
   clientIp: string;
+  forwardedFor: string;
+  forwardedProto: 'http' | 'https';
+  forwardedHost?: string;
   requestId: string;
   upstreamHost: string;
   bodyLength: number;
 }
 
-/** Headers sent to the upstream: the client's end-to-end headers plus standard proxy headers. */
+/**
+ * Headers that claim something about the client's identity or the original
+ * request. Upstreams commonly trust them, so whatever the client sent is
+ * dropped and the gateway sets its own (see clientIdentity.ts).
+ */
+const CLIENT_IDENTITY = new Set(['forwarded', 'x-real-ip', 'x-client-ip', 'true-client-ip']);
+const isIdentityHeader = (name: string) => CLIENT_IDENTITY.has(name) || name.startsWith('x-forwarded-');
+
+/** Headers sent to the upstream: the client's end-to-end headers plus the gateway's own proxy headers. */
 export function upstreamRequestHeaders(clientHeaders: IncomingHttpHeaders, info: ForwardingInfo): OutgoingHttpHeaders {
   const headers: OutgoingHttpHeaders = withoutHopByHop(clientHeaders);
+  for (const name of Object.keys(headers)) if (isIdentityHeader(name)) delete headers[name];
 
-  const priorForwardedFor = clientHeaders['x-forwarded-for'];
-  headers['x-forwarded-for'] = priorForwardedFor ? `${priorForwardedFor}, ${info.clientIp}` : info.clientIp;
-  if (clientHeaders.host) headers['x-forwarded-host'] = clientHeaders.host;
-  headers['x-forwarded-proto'] = 'http';
+  headers['x-forwarded-for'] = info.forwardedFor;
+  headers['x-real-ip'] = info.clientIp;
+  headers['x-forwarded-proto'] = info.forwardedProto;
+  if (info.forwardedHost) headers['x-forwarded-host'] = info.forwardedHost;
   headers['x-request-id'] = info.requestId;
   headers.host = info.upstreamHost;
 

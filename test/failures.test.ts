@@ -141,11 +141,11 @@ describe('clients that go away', () => {
 
 describe('circuit breaker failure path', () => {
   it('re-opens when the half-open trial request fails', async () => {
-    expect((await send('/api/breaker/status/500')).status).toBe(500); // threshold 1: opens
+    expect((await send('/api/breaker/status/503')).status).toBe(503); // threshold 1: opens
     expect((await send('/api/breaker/ok')).status).toBe(503);
 
     await sleep(250); // cooldown is 200ms
-    expect((await send('/api/breaker/status/500')).status).toBe(500); // trial fails: re-opens
+    expect((await send('/api/breaker/status/503')).status).toBe(503); // trial fails: re-opens
     const rejected = await send('/api/breaker/ok');
     expect(rejected.status).toBe(503);
     expect(await rejected.json()).toEqual({ error: 'service_unavailable', retry_after: 1 });

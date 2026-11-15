@@ -50,7 +50,13 @@ const NOT_SENT_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOST
  */
 export abstract class UpstreamError extends GatewayError {}
 
-/** The upstream could not be reached or broke the connection: 502. */
+/**
+ * The upstream could not be reached or broke the connection: 502.
+ *
+ * `message` names the upstream and the cause, for the gateway's logs. The
+ * client only gets a generic message: upstream addresses and network errors
+ * would reveal the internal network layout.
+ */
 export class UpstreamUnavailableError extends UpstreamError {
   /** True when the request is known not to have reached the upstream (e.g. connection refused). */
   readonly requestNotSent: boolean;
@@ -59,12 +65,20 @@ export class UpstreamUnavailableError extends UpstreamError {
     super(502, 'bad_gateway', `upstream ${target} is unavailable: ${cause.message}`);
     this.requestNotSent = code !== undefined && NOT_SENT_CODES.has(code);
   }
+
+  override toBody(): Record<string, unknown> {
+    return { error: this.code, message: 'the upstream service is unavailable' };
+  }
 }
 
-/** The upstream did not send response headers within the route's timeout: 504. */
+/** The upstream did not send response headers within the route's timeout: 504. Detail is for logs only. */
 export class UpstreamTimeoutError extends UpstreamError {
   constructor(target: string, timeoutMs: number) {
     super(504, 'gateway_timeout', `upstream ${target} did not respond within ${timeoutMs}ms`);
+  }
+
+  override toBody(): Record<string, unknown> {
+    return { error: this.code, message: 'the upstream service did not respond in time' };
   }
 }
 
@@ -80,6 +94,16 @@ export class CircuitOpenError extends GatewayError {
 
   override toBody(): Record<string, unknown> {
     return { error: this.code, retry_after: this.retryAfterSeconds };
+  }
+}
+
+/**
+ * Too many request bodies are held in memory gateway-wide: 503 with Retry-After.
+ * Protects the process from running out of memory under many concurrent uploads.
+ */
+export class ServerBusyError extends GatewayError {
+  constructor() {
+    super(503, 'server_busy', 'the gateway is handling too many uploads; retry shortly', { 'retry-after': '1' });
   }
 }
 

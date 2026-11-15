@@ -95,6 +95,12 @@ export interface RouteConfig {
 
 export interface GatewayConfig {
   port: number;
+  /**
+   * Load balancers / proxies in front of the gateway (IPs or CIDR ranges). Only
+   * requests from these keep their X-Forwarded-* headers. Empty by default: the
+   * gateway is the edge. An optional extension to the spec's schema.
+   */
+  trustedProxies: string[];
   globalTimeoutMs: number;
   globalRateLimit: RateLimitConfig | null;
   routes: RouteConfig[];

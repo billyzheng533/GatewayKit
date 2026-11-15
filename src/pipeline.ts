@@ -39,7 +39,10 @@ export interface GatewayRequest {
    * Repeated calls (retries) get the same buffer.
    */
   readBody(): Promise<Buffer>;
+  /** Who the client is: the socket address, or, behind a trusted proxy, the client it reports. */
   clientIp: string;
+  /** What to tell the upstream about the client (X-Forwarded-For, -Proto, -Host). */
+  forwarded: { for: string; proto: 'http' | 'https'; host?: string };
 }
 
 export interface GatewayResponse {

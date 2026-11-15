@@ -111,7 +111,7 @@ describe('retry', () => {
 describe('circuit breaker', () => {
   it('opens after `threshold` failures, rejects without calling the upstream, then recovers after the cooldown', async () => {
     for (let i = 0; i < 3; i += 1) {
-      expect((await send('/api/cb/status/500')).status).toBe(500);
+      expect((await send('/api/cb/status/503')).status).toBe(503);
     }
     const before = breakerUpstream.requests.length;
 
@@ -124,6 +124,13 @@ describe('circuit breaker', () => {
     await new Promise((resolve) => setTimeout(resolve, 350)); // cooldown is 300ms
     expect((await send('/api/cb/trial')).status).toBe(200); // half-open trial succeeds
     expect((await send('/api/cb/after')).status).toBe(200); // closed again
+  });
+
+  it('does not count a plain 500, so one bad request cannot open the breaker for everyone', async () => {
+    for (let i = 0; i < 5; i += 1) {
+      expect((await send('/api/cb/status/500')).status).toBe(500);
+    }
+    expect((await send('/api/cb/still-closed-after-500s')).status).toBe(200);
   });
 
   it('counts 4xx responses as successes', async () => {

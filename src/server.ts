@@ -3,13 +3,14 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { pipeline } from 'node:stream/promises';
 import type { GatewayConfig, RouteConfig } from './config/types.js';
-import { ClientClosedError, GatewayError, PayloadTooLargeError } from './errors.js';
+import { ClientClosedError, GatewayError, PayloadTooLargeError, ServerBusyError } from './errors.js';
 import { buildRouteMiddleware } from './features/index.js';
 import { silentLogger, type Logger } from './logger.js';
 import { compose, type GatewayResponse, type Handler, type RequestContext } from './pipeline.js';
 import { UpstreamClient } from './proxy/client.js';
 import { HealthChecker } from './proxy/healthCheck.js';
 import { createUpstreamHandler } from './proxy/upstream.js';
+import { resolveClient, trustedProxyList } from './clientIdentity.js';
 import { normalizePath } from './path.js';
 import { Router } from './router.js';
 
@@ -24,8 +25,22 @@ export const MAX_BODY_BYTES = 10 * 1024 * 1024;
 export const MAX_HEADER_BYTES = 16 * 1024;
 const SHUTDOWN_GRACE_MS = 10_000;
 
+/** Request bodies held in memory at once, across all requests. Past it, uploads get 503. */
+export const MAX_BUFFERED_BODY_BYTES = 256 * 1024 * 1024;
+/** Time to receive a whole request, body included (Node's default is 5 minutes), and its headers. */
+const REQUEST_TIMEOUT_MS = 60_000;
+const HEADERS_TIMEOUT_MS = 20_000;
+/** Open client connections; further ones are dropped until some close. */
+const MAX_CONNECTIONS = 10_000;
+
 export interface GatewayOptions {
   logger?: Logger;
+  /** Overrides MAX_BUFFERED_BODY_BYTES (tests use a small budget). */
+  maxBufferedBodyBytes?: number;
+  /** Overrides REQUEST_TIMEOUT_MS (tests use a short one). */
+  requestTimeoutMs?: number;
+  /** Overrides MAX_CONNECTIONS. */
+  maxConnections?: number;
   /** Overrides config.gateway.port (tests use 0 for a random free port). */
   port?: number;
   host?: string;
@@ -49,6 +64,7 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
   const logger = options.logger ?? silentLogger;
   const client = new UpstreamClient();
   const startedAt = Date.now();
+  const trustedProxies = trustedProxyList(config.trustedProxies);
 
   // Routes with `health_check` get a checker; the load balancer skips targets it marks unhealthy.
   const healthCheckers: HealthChecker[] = [];
@@ -72,12 +88,24 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
     })),
   );
 
-  const server = http.createServer({ maxHeaderSize: MAX_HEADER_BYTES }, (req, res) => {
+  const bodyBudget = new ByteBudget(options.maxBufferedBodyBytes ?? MAX_BUFFERED_BODY_BYTES);
+  const requestTimeout = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+  const server = http.createServer(
+    {
+      maxHeaderSize: MAX_HEADER_BYTES,
+      requestTimeout,
+      headersTimeout: Math.min(HEADERS_TIMEOUT_MS, requestTimeout),
+      // How often Node checks those timeouts (default 30s, too coarse for a 60s limit).
+      connectionsCheckingInterval: Math.max(100, Math.min(2_000, requestTimeout / 4)),
+    },
+    (req, res) => {
     handleRequest(req, res).catch((err: unknown) => {
       logger.error('unhandled error while handling request', { error: String(err) });
       res.destroy();
     });
-  });
+    },
+  );
+  server.maxConnections = options.maxConnections ?? MAX_CONNECTIONS;
 
   // Requests Node rejects while parsing (too-large headers, malformed HTTP) never
   // reach handleRequest. Answer them in the same JSON error format as everything else.
@@ -156,13 +184,22 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
 
     // Cancel upstream work if the client disconnects before we've responded.
     const abort = new AbortController();
+    // Bytes of this request's body counted against the gateway-wide budget, released when it's done.
+    let reservedBytes = 0;
+    const reserve = (bytes: number) => {
+      if (!bodyBudget.tryReserve(bytes)) return false;
+      reservedBytes += bytes;
+      return true;
+    };
     res.on('close', () => {
       if (!res.writableFinished) abort.abort();
+      bodyBudget.release(reservedBytes);
     });
 
     let response: GatewayResponse;
     try {
       let bodyRead: Promise<Buffer> | undefined;
+      const client = resolveClient(req.socket.remoteAddress, req.headers, trustedProxies);
       const ctx: RequestContext = {
         route: route.config,
         request: {
@@ -172,8 +209,13 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
           headers: req.headers,
           headersDistinct: req.headersDistinct,
           // Lazy and memoized: read on first call (by the upstream handler), reused on retries.
-          readBody: () => (bodyRead ??= readBody(req, MAX_BODY_BYTES)),
-          clientIp: req.socket.remoteAddress ?? 'unknown',
+          readBody: () => (bodyRead ??= readBody(req, MAX_BODY_BYTES, reserve)),
+          clientIp: client.clientIp,
+          forwarded: {
+            for: client.forwardedFor,
+            proto: client.forwardedProto,
+            ...(client.forwardedHost ? { host: client.forwardedHost } : {}),
+          },
         },
         requestId,
         receivedAt: new Date(),
@@ -246,7 +288,24 @@ function singleHeader(value: string | string[] | undefined): string | undefined 
 /** How long to keep draining an oversized body before giving up on the connection. */
 const DISCARD_BODY_MS = 5_000;
 
-function readBody(req: IncomingMessage, limitBytes: number): Promise<Buffer> {
+/** Bytes held in memory across all requests, with a hard limit. */
+class ByteBudget {
+  private used = 0;
+
+  constructor(private readonly limit: number) {}
+
+  tryReserve(bytes: number): boolean {
+    if (this.used + bytes > this.limit) return false;
+    this.used += bytes;
+    return true;
+  }
+
+  release(bytes: number): void {
+    this.used -= bytes;
+  }
+}
+
+function readBody(req: IncomingMessage, limitBytes: number, reserve: (bytes: number) => boolean): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const declared = Number(req.headers['content-length']);
     if (Number.isFinite(declared) && declared > limitBytes) {
@@ -268,6 +327,12 @@ function readBody(req: IncomingMessage, limitBytes: number): Promise<Buffer> {
         cleanup();
         discardBody(req);
         reject(new PayloadTooLargeError(limitBytes));
+        return;
+      }
+      if (!reserve(chunk.length)) {
+        cleanup();
+        discardBody(req);
+        reject(new ServerBusyError());
         return;
       }
       chunks.push(chunk);

@@ -19,8 +19,8 @@ export class UpstreamClient {
    * Resolves once the upstream sends response headers. Rejects with:
    *   - UpstreamTimeoutError if headers don't arrive within `timeoutMs`
    *   - UpstreamUnavailableError on connection errors (refused, reset, DNS, ...)
-   * The timeout covers time-to-headers only; once streaming starts, the body
-   * is relayed until the upstream finishes or the client disconnects.
+   * The same timeout then applies to the body as an idle timeout: if no data
+   * arrives for that long, the upstream (and so the client) connection is cut.
    */
   async send(ctx: RequestContext, target: URL, timeoutMs: number): Promise<GatewayResponse> {
     const { request } = ctx;
@@ -48,6 +48,9 @@ export class UpstreamClient {
           path,
           headers: upstreamRequestHeaders(request.headers, {
             clientIp: request.clientIp,
+            forwardedFor: request.forwarded.for,
+            forwardedProto: request.forwarded.proto,
+            ...(request.forwarded.host ? { forwardedHost: request.forwarded.host } : {}),
             requestId: ctx.requestId,
             upstreamHost: target.host,
             bodyLength: body.length,
@@ -62,6 +65,14 @@ export class UpstreamClient {
           }
           settled = true;
           clearTimeout(timer);
+          // Once headers arrive, the body must keep moving: if the upstream goes quiet for the
+          // route's timeout, destroy it. That cuts the client's connection too (the response
+          // is already streaming), so a stalled upstream can't hold both sockets forever.
+          upstreamRes.setTimeout(timeoutMs, () => {
+            upstreamRes.destroy(new Error(`upstream ${targetLabel} stalled: no response data for ${timeoutMs}ms`));
+          });
+          // Clear it once the body is done, so the pooled keep-alive socket doesn't keep the timer.
+          upstreamRes.once('end', () => upstreamRes.socket?.setTimeout(0));
           resolve({
             status: upstreamRes.statusCode ?? 502,
             headers: withoutHopByHop(upstreamRes.headers),

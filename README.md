@@ -281,7 +281,7 @@ The route also requires an API key, so the requests send one. After this, `/api/
 30 seconds, then lets a trial request through:
 
 ```bash
-for i in 1 2 3 4 5 6; do curl -s -H 'X-API-Key: sk_live_abc123' "localhost:8080/api/internal/status/500"; echo; done
+for i in 1 2 3 4 5 6; do curl -s -H 'X-API-Key: sk_live_abc123' "localhost:8080/api/internal/status/503"; echo; done
 ```
 
 **Rate limiting:** `/api/orders` allows 10 requests per 10 seconds per client. The 11th and 12th get 429

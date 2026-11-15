@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { parse as parseYaml } from 'yaml';
+import { invalidTrustedProxy } from '../clientIdentity.js';
 import { normalizePath } from '../path.js';
 import { MAX_TIMER_MS, parseDuration } from './duration.js';
 import type {
@@ -73,7 +74,7 @@ export function validateConfig(raw: unknown): LoadedConfig {
   v.knownKeys(root, 'config', ['gateway', 'routes'], { allowPrefix: 'x-' });
 
   const gateway = root.gateway === undefined ? {} : v.mapping(root.gateway, 'gateway');
-  v.knownKeys(gateway, 'gateway', ['port', 'global_timeout', 'global_rate_limit']);
+  v.knownKeys(gateway, 'gateway', ['port', 'global_timeout', 'global_rate_limit', 'trusted_proxies']);
 
   const port = gateway.port === undefined ? DEFAULT_PORT : v.integer(gateway.port, 'gateway.port', 0, 65_535);
   if (port === 0 && gateway.port === 0) v.warn('gateway.port: 0 means "any free port"; the actual port is logged at startup');
@@ -81,6 +82,12 @@ export function validateConfig(raw: unknown): LoadedConfig {
     gateway.global_timeout === undefined
       ? DEFAULT_TIMEOUT_MS
       : v.duration(gateway.global_timeout, 'gateway.global_timeout', { timer: true });
+  const trustedProxies =
+    gateway.trusted_proxies === undefined ? [] : v.stringList(gateway.trusted_proxies, 'gateway.trusted_proxies');
+  trustedProxies.forEach((entry, i) => {
+    const problem = entry === '' ? undefined : invalidTrustedProxy(entry);
+    if (problem) v.error(`gateway.trusted_proxies[${i}]`, problem);
+  });
   const globalRateLimit =
     gateway.global_rate_limit === undefined ? null : parseRateLimit(v, gateway.global_rate_limit, 'gateway.global_rate_limit');
 
@@ -89,15 +96,20 @@ export function validateConfig(raw: unknown): LoadedConfig {
 
   const routes = rawRoutes.map((route, i) => parseRoute(v, route, `routes[${i}]`, { globalTimeoutMs, globalRateLimit }));
 
+  // Case-insensitive, like routing: "/API" and "/api" would be the same route.
   const seen = new Map<string, number>();
   routes.forEach((route, i) => {
-    const first = seen.get(route.path);
-    if (first !== undefined) v.error(`routes[${i}].path`, `duplicates routes[${first}].path "${route.path}"`);
-    else seen.set(route.path, i);
+    const first = seen.get(route.path.toLowerCase());
+    if (first !== undefined) {
+      const firstPath = routes[first]?.path ?? route.path;
+      const caseNote = firstPath === route.path ? '' : ' (route paths match regardless of case)';
+      v.error(`routes[${i}].path`, `duplicates routes[${first}].path "${firstPath}"${caseNote}`);
+    }
+    else seen.set(route.path.toLowerCase(), i);
   });
 
   if (v.issues.length > 0) throw new ConfigError(v.issues);
-  return { config: { port, globalTimeoutMs, globalRateLimit, routes }, warnings: v.warnings };
+  return { config: { port, globalTimeoutMs, globalRateLimit, trustedProxies, routes }, warnings: v.warnings };
 }
 
 interface RouteDefaults {
@@ -176,7 +188,7 @@ function checkRoutePath(v: Validator, path: string, at: string): void {
   try {
     normalized = normalizePath(path);
   } catch {
-    v.error(at, 'must not contain encoded slashes (%2F, %5C), backslashes, null bytes, or ".." above "/"');
+    v.error(at, 'must not contain encoded slashes (%2F, %5C), backslashes, null bytes, ";", or ".." above "/"');
     return;
   }
   if (normalized !== path) {
@@ -276,14 +288,30 @@ function parseHealthCheck(v: Validator, raw: unknown, at: string): HealthCheckCo
   };
 }
 
-function parseHeaderTransform(v: Validator, raw: unknown, at: string): HeaderTransform {
+/** Headers that `add` must not set: they belong to the connection or the gateway's own framing. */
+const UNSETTABLE_HEADERS = new Set([
+  'host',
+  'content-length',
+  'transfer-encoding',
+  'connection',
+  'keep-alive',
+  'upgrade',
+  'te',
+  'trailer',
+  'proxy-connection',
+]);
+
+function parseHeaderTransform(v: Validator, raw: unknown, at: string, side: 'request' | 'response'): HeaderTransform {
   const h = v.mapping(raw, at);
   v.knownKeys(h, at, ['add', 'remove']);
   const add: Record<string, string> = {};
   if (h.add !== undefined) {
     for (const [name, value] of Object.entries(v.mapping(h.add, `${at}.add`))) {
       v.headerName(name, `${at}.add.${name}`);
-      add[name] = v.headerValue(v.scalarString(value, `${at}.add.${name}`), `${at}.add.${name}`);
+      if (UNSETTABLE_HEADERS.has(name.toLowerCase())) v.error(`${at}.add.${name}`, 'cannot be set by a transform');
+      const value_ = v.headerValue(v.scalarString(value, `${at}.add.${name}`), `${at}.add.${name}`);
+      checkHeaderVariable(v, value_, `${at}.add.${name}`, side);
+      add[name] = value_;
     }
   }
   const remove = h.remove === undefined ? [] : v.stringList(h.remove, `${at}.remove`);
@@ -291,11 +319,23 @@ function parseHeaderTransform(v: Validator, raw: unknown, at: string): HeaderTra
   return { add, remove };
 }
 
+/**
+ * A header value starting with "$" must be a known variable (or "$literal:..."),
+ * so a typo like "$requst_time" is caught at startup instead of being sent as text.
+ */
+function checkHeaderVariable(v: Validator, value: string, at: string, side: 'request' | 'response'): void {
+  if (!value.startsWith('$') || value.startsWith('$literal:')) return;
+  const allowed = side === 'request' ? ['$request_time', '$route_path'] : ['$request_time', '$response_time', '$route_path'];
+  if (!allowed.includes(value)) {
+    v.error(at, `unknown variable "${value}" (use one of ${allowed.join(', ')}, or "$literal:..." for literal text)`);
+  }
+}
+
 function parseRequestTransform(v: Validator, raw: unknown, at: string): RequestTransformConfig {
   const t = v.mapping(raw, at);
   v.knownKeys(t, at, ['headers', 'body']);
   const result: RequestTransformConfig = {};
-  if (t.headers !== undefined) result.headers = parseHeaderTransform(v, t.headers, `${at}.headers`);
+  if (t.headers !== undefined) result.headers = parseHeaderTransform(v, t.headers, `${at}.headers`, 'request');
   if (t.body !== undefined) {
     const body = v.mapping(t.body, `${at}.body`);
     v.knownKeys(body, `${at}.body`, ['mapping']);
@@ -312,7 +352,7 @@ function parseResponseTransform(v: Validator, raw: unknown, at: string): Respons
   const t = v.mapping(raw, at);
   v.knownKeys(t, at, ['headers', 'body']);
   const result: ResponseTransformConfig = {};
-  if (t.headers !== undefined) result.headers = parseHeaderTransform(v, t.headers, `${at}.headers`);
+  if (t.headers !== undefined) result.headers = parseHeaderTransform(v, t.headers, `${at}.headers`, 'response');
   if (t.body !== undefined) {
     const body = v.mapping(t.body, `${at}.body`);
     v.knownKeys(body, `${at}.body`, ['envelope']);

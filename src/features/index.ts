@@ -5,6 +5,7 @@ import { authFeature } from './auth/index.js';
 import { circuitBreakerFeature } from './circuitBreaker/index.js';
 import { rateLimitFeature } from './rateLimit/index.js';
 import { retryFeature } from './retry/index.js';
+import { transformFeature } from './transform/index.js';
 
 /**
  * Feature registry: the extension point for config features.
@@ -37,11 +38,18 @@ export interface Feature {
  *                    before auth on purpose: failed key guesses use up the
  *                    budget, so keys can't be brute-forced at full speed
  *   auth             reject requests without a valid key before any upstream work
+ *   transform        header add/remove: once per request, before retries; on the final response
  *   retry            wraps the breaker, so each attempt is counted separately
  *                    and retrying stops once the breaker opens
  *   circuit_breaker  innermost, closest to the upstream call
  */
-export const FEATURES: readonly Feature[] = [rateLimitFeature, authFeature, retryFeature, circuitBreakerFeature];
+export const FEATURES: readonly Feature[] = [
+  rateLimitFeature,
+  authFeature,
+  transformFeature,
+  retryFeature,
+  circuitBreakerFeature,
+];
 
 export function buildRouteMiddleware(route: RouteConfig, deps: FeatureDeps): Middleware[] {
   return FEATURES.map((feature) => feature.create(route, deps)).filter((mw): mw is Middleware => mw !== null);
@@ -51,16 +59,16 @@ export function buildRouteMiddleware(route: RouteConfig, deps: FeatureDeps): Mid
  * Config keys that are parsed and validated but not enforced yet. Logged at
  * startup so nobody assumes, say, auth is on when it isn't.
  */
-const NOT_YET_ENFORCED: Array<[keyof RouteConfig, string]> = [
-  ['requestTransform', 'request_transform'],
-  ['responseTransform', 'response_transform'],
+const NOT_YET_ENFORCED: Array<[(route: RouteConfig) => unknown, string]> = [
+  [(route) => route.requestTransform?.bodyMapping, 'request_transform.body'],
+  [(route) => route.responseTransform?.bodyEnvelope, 'response_transform.body'],
 ];
 
 export function unenforcedFeatureWarnings(config: GatewayConfig): string[] {
   const warnings: string[] = [];
   for (const route of config.routes) {
-    for (const [key, label] of NOT_YET_ENFORCED) {
-      if (route[key] !== undefined && route[key] !== null) {
+    for (const [configured, label] of NOT_YET_ENFORCED) {
+      if (configured(route) !== undefined) {
         warnings.push(`route ${route.path}: "${label}" is configured but not implemented yet; it is ignored`);
       }
     }

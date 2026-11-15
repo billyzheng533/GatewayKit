@@ -32,6 +32,7 @@ function contextFor(method: string, controller = new AbortController()): Request
       headersDistinct: {},
       readBody: async () => Buffer.alloc(0),
       clientIp: '127.0.0.1',
+      forwarded: { for: '127.0.0.1', proto: 'http' },
     },
     requestId: 'test',
     receivedAt: new Date(),

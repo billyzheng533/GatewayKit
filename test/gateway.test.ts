@@ -95,12 +95,14 @@ describe('proxying', () => {
     expect(await json(res)).toEqual({ upstream: 'users', status: 418 });
   });
 
-  it('adds X-Forwarded-* and X-Request-Id headers and rewrites Host', async () => {
+  it('sets X-Forwarded-For to the real client address (ignoring a spoofed one), X-Request-Id, and rewrites Host', async () => {
     const res = await get('/api/users', { headers: { 'x-request-id': 'req-123', 'x-forwarded-for': '10.0.0.1' } });
     const { headers } = await json(res);
     expect(headers['x-request-id']).toBe('req-123');
-    expect(headers['x-forwarded-for']).toMatch(/^10\.0\.0\.1, /);
+    expect(headers['x-forwarded-for']).toBe('127.0.0.1');
+    expect(headers['x-real-ip']).toBe('127.0.0.1');
     expect(headers['x-forwarded-proto']).toBe('http');
+    expect(headers['x-forwarded-host']).toBeUndefined();
     expect(headers.host).toBe(new URL(users.url).host);
     expect(res.headers.get('x-request-id')).toBe('req-123');
   });
@@ -155,7 +157,9 @@ describe('upstream failures', () => {
     expect(res.status).toBe(502);
     const body = await json(res);
     expect(body.error).toBe('bad_gateway');
-    expect(body.message).toMatch(/is unavailable: .*ECONNREFUSED/);
+    // Generic for the client: no upstream address or network error (those stay in the logs).
+    expect(body.message).toBe('the upstream service is unavailable');
+    expect(JSON.stringify(body)).not.toMatch(/127\.0\.0\.1|localhost|ECONNREFUSED/);
   });
 
   it('returns 504 when the upstream exceeds the route timeout', async () => {

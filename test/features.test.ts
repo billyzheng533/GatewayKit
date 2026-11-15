@@ -14,12 +14,13 @@ routes:
   - path: "/api/legacy"
     methods: ["GET"]
     upstream: { url: "http://c" }
-    request_transform: { headers: { add: { X-A: "1" } } }
-    response_transform: { headers: { remove: ["Server"] } }
+    request_transform: { headers: { add: { X-A: "1" } }, body: { mapping: { user.id: "userId" } } }
+    response_transform: { headers: { remove: ["Server"] }, body: { envelope: { data: "$body" } } }
 `);
+    // Header transforms are implemented; only the body parts are reported.
     expect(unenforcedFeatureWarnings(config)).toEqual([
-      'route /api/legacy: "request_transform" is configured but not implemented yet; it is ignored',
-      'route /api/legacy: "response_transform" is configured but not implemented yet; it is ignored',
+      'route /api/legacy: "request_transform.body" is configured but not implemented yet; it is ignored',
+      'route /api/legacy: "response_transform.body" is configured but not implemented yet; it is ignored',
     ]);
   });
 
@@ -34,6 +35,8 @@ routes:
     auth: { type: "api_key", keys: ["k"] }
     retry: { attempts: 2 }
     circuit_breaker: { threshold: 1, window: "1s", cooldown: "1s" }
+    request_transform: { headers: { remove: ["X-Debug"] } }
+    response_transform: { headers: { add: { X-Served-By: "gk" } } }
 `);
     expect(unenforcedFeatureWarnings(config)).toEqual([]);
   });

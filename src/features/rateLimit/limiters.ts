@@ -52,6 +52,17 @@ export class FixedWindowLimiter implements RateLimiter {
     return this.windows.size;
   }
 
+  /** The decision consume() would make, without counting anything. */
+  peek(key: string, now: number): RateLimitDecision {
+    const window = this.windows.get(key);
+    if (!window || now - window.start >= this.windowMs) {
+      return { allowed: true, limit: this.limit, remaining: this.limit, retryAfterMs: 0, resetMs: 0 };
+    }
+    const resetMs = window.start + this.windowMs - now;
+    const remaining = Math.max(0, this.limit - window.count);
+    return { allowed: remaining > 0, limit: this.limit, remaining, retryAfterMs: remaining > 0 ? 0 : resetMs, resetMs };
+  }
+
   consume(key: string, now: number): RateLimitDecision {
     this.sweep(now);
     let window = this.windows.get(key);

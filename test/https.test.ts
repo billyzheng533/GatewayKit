@@ -5,7 +5,9 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { startTestGateway } from './helpers.js';
+import { parseConfig } from '../src/config/load.js';
+import type { Logger } from '../src/logger.js';
+import { startGateway } from '../src/server.js';
 
 /**
  * HTTPS upstreams. The test upstream uses a self-signed certificate from
@@ -41,12 +43,16 @@ afterAll(async () => {
 });
 
 describe('HTTPS upstreams', () => {
-  it('rejects an upstream whose certificate is not trusted, with a 502', async () => {
-    const gateway = await startTestGateway(`routes: [{ path: "/s", methods: ["GET"], upstream: { url: "${upstreamUrl}" } }]`);
+  it('rejects an upstream whose certificate is not trusted, with a 502, and logs why', async () => {
+    const logged: Array<Record<string, unknown>> = [];
+    const logger: Logger = { info: () => {}, warn: (_m, fields = {}) => logged.push(fields), error: () => {} };
+    const { config } = parseConfig(`routes: [{ path: "/s", methods: ["GET"], upstream: { url: "${upstreamUrl}" } }]`);
+    const gateway = await startGateway(config, { port: 0, logger });
     try {
       const res = await fetch(`${gateway.url}/s/x`);
       expect(res.status).toBe(502);
-      expect(((await res.json()) as { message: string }).message).toMatch(/certificate/i);
+      expect(await res.json()).toEqual({ error: 'bad_gateway', message: 'the upstream service is unavailable' });
+      expect(String(logged.at(-1)?.error)).toMatch(/certificate/i); // the reason is in the log, not the response
     } finally {
       await gateway.close();
     }

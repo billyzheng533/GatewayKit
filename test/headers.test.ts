@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { upstreamRequestHeaders, withoutHopByHop } from '../src/proxy/headers.js';
 
-const info = { clientIp: '203.0.113.7', requestId: 'req-1', upstreamHost: 'users.internal:3001', bodyLength: 0 };
+const info = {
+  clientIp: '203.0.113.7',
+  forwardedFor: '203.0.113.7',
+  forwardedProto: 'http' as const,
+  requestId: 'req-1',
+  upstreamHost: 'users.internal:3001',
+  bodyLength: 0,
+};
 
 describe('withoutHopByHop', () => {
   it('drops standard hop-by-hop headers and keeps end-to-end ones', () => {
@@ -29,21 +36,52 @@ describe('withoutHopByHop', () => {
 });
 
 describe('upstreamRequestHeaders', () => {
-  it('adds forwarding headers and points Host at the upstream', () => {
+  it('sets the gateway\'s own forwarding headers and points Host at the upstream', () => {
     const headers = upstreamRequestHeaders({ host: 'gateway.example:8080', accept: '*/*' }, info);
     expect(headers).toEqual({
       accept: '*/*',
       host: 'users.internal:3001',
       'x-forwarded-for': '203.0.113.7',
-      'x-forwarded-host': 'gateway.example:8080',
+      'x-real-ip': '203.0.113.7',
       'x-forwarded-proto': 'http',
       'x-request-id': 'req-1',
     });
   });
 
-  it('appends to an existing X-Forwarded-For chain', () => {
-    const headers = upstreamRequestHeaders({ 'x-forwarded-for': '10.0.0.1, 10.0.0.2' }, info);
-    expect(headers['x-forwarded-for']).toBe('10.0.0.1, 10.0.0.2, 203.0.113.7');
+  it('drops every client-supplied identity header and replaces them with its own', () => {
+    const headers = upstreamRequestHeaders(
+      {
+        'x-forwarded-for': '6.6.6.6',
+        'x-real-ip': '6.6.6.6',
+        forwarded: 'for=6.6.6.6',
+        'x-forwarded-host': 'evil.example',
+        'x-forwarded-proto': 'https',
+        'x-forwarded-port': '443',
+        'x-client-ip': '6.6.6.6',
+        'true-client-ip': '6.6.6.6',
+      },
+      info,
+    );
+    expect(headers['x-forwarded-for']).toBe('203.0.113.7');
+    expect(headers['x-real-ip']).toBe('203.0.113.7');
+    expect(headers['x-forwarded-proto']).toBe('http');
+    for (const name of ['forwarded', 'x-forwarded-host', 'x-forwarded-port', 'x-client-ip', 'true-client-ip']) {
+      expect(headers[name]).toBeUndefined();
+    }
+  });
+
+  it('never derives X-Forwarded-Host from the client\'s Host header', () => {
+    expect(upstreamRequestHeaders({ host: 'evil.example' }, info)['x-forwarded-host']).toBeUndefined();
+  });
+
+  it('passes on the chain, protocol and host it was given for a trusted proxy', () => {
+    const headers = upstreamRequestHeaders(
+      {},
+      { ...info, forwardedFor: '198.51.100.9, 10.0.0.5', forwardedProto: 'https', forwardedHost: 'shop.example' },
+    );
+    expect(headers['x-forwarded-for']).toBe('198.51.100.9, 10.0.0.5');
+    expect(headers['x-forwarded-proto']).toBe('https');
+    expect(headers['x-forwarded-host']).toBe('shop.example');
   });
 
   it('replaces chunked framing with an exact Content-Length for the buffered body', () => {

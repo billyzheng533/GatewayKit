@@ -39,8 +39,8 @@ describe('compose', () => {
 });
 
 describe('the feature pipeline', () => {
-  it('runs features in this order: rate limit, auth, retry, circuit breaker', () => {
-    expect(FEATURES.map((f) => f.name)).toEqual(['rate_limit', 'auth', 'retry', 'circuit_breaker']);
+  it('runs features in this order: rate limit, auth, transform, retry, circuit breaker', () => {
+    expect(FEATURES.map((f) => f.name)).toEqual(['rate_limit', 'auth', 'transform', 'retry', 'circuit_breaker']);
   });
 
   it('only includes the features a route configures', () => {
@@ -57,7 +57,7 @@ routes:
 `);
     const deps = { logger: silentLogger, now: Date.now };
     expect(buildRouteMiddleware(config.routes[0]!, deps)).toHaveLength(0);
-    expect(buildRouteMiddleware(config.routes[1]!, deps)).toHaveLength(4);
+    expect(buildRouteMiddleware(config.routes[1]!, deps)).toHaveLength(4); // no transform configured
   });
 });
 

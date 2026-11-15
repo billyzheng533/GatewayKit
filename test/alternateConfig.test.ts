@@ -75,7 +75,7 @@ describe('examples/alternate-gateway.yaml', () => {
 
   it('opens the /billing circuit breaker after 2 failures', async () => {
     for (let i = 0; i < 2; i += 1) {
-      expect((await send('/billing/status/500', { method: 'POST', body: '{}' })).status).toBe(500);
+      expect((await send('/billing/status/503', { method: 'POST', body: '{}' })).status).toBe(503);
     }
     const res = await send('/billing/charge', { method: 'POST', body: '{}' });
     expect(res.status).toBe(503);

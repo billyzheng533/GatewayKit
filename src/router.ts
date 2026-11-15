@@ -3,6 +3,11 @@
  * segment boundary: "/api/users" matches "/api/users" and "/api/users/42" but
  * not "/api/usersettings". When several routes match, the longest (most
  * specific) prefix wins, regardless of order in the config file.
+ *
+ * Matching ignores case. Many upstream frameworks (Express by default) treat
+ * "/api/Internal" and "/api/internal" as the same, so case-sensitive matching
+ * would let "/api/Internal/..." fall through to a broader route and skip the
+ * "/api/internal" route's auth. The path is still forwarded as sent.
  */
 export class Router<T extends { path: string }> {
   private readonly routes: T[];
@@ -18,7 +23,9 @@ export class Router<T extends { path: string }> {
 
 export function pathMatches(prefix: string, pathname: string): boolean {
   if (prefix === '/') return true;
-  return pathname === prefix || pathname.startsWith(`${prefix}/`);
+  const p = prefix.toLowerCase();
+  const path = pathname.toLowerCase();
+  return path === p || path.startsWith(`${p}/`);
 }
 
 /** Path to send upstream: with strip_prefix, "/api/products/123" -> "/123" and "/api/products" -> "/". */

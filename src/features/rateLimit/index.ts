@@ -1,4 +1,5 @@
 import { GatewayError, errorResponse } from '../../errors.js';
+import { rateLimitKey } from '../../clientIdentity.js';
 import { secondsUntil } from '../../time.js';
 import type { Feature } from '../index.js';
 import { createLimiter, type RateLimitDecision } from './limiters.js';
@@ -21,7 +22,7 @@ export const rateLimitFeature: Feature = {
     const limiter = createLimiter(config);
 
     return async (ctx, next) => {
-      const key = config.per === 'global' ? GLOBAL_KEY : ctx.request.clientIp;
+      const key = config.per === 'global' ? GLOBAL_KEY : rateLimitKey(ctx.request.clientIp);
       const decision = limiter.consume(key, now());
       const headers = rateLimitHeaders(decision);
 

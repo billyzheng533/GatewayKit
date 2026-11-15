@@ -4,11 +4,19 @@ import type { Feature } from '../index.js';
 import { CircuitBreaker, type Outcome } from './breaker.js';
 
 /**
+ * Statuses that say the upstream itself is down or overloaded. A 500 is left
+ * out on purpose: it usually means one request hit a bug, and if it counted, any
+ * client that found an input causing a 500 could open the breaker and block the
+ * route for everyone for the whole cooldown.
+ */
+const UPSTREAM_DOWN_STATUSES = new Set([502, 503, 504]);
+
+/**
  * Enforces a route's `circuit_breaker`.
  *
- * A failure is an upstream that couldn't be reached, timed out (502/504), or
- * answered with a 5xx. 4xx responses are the client's problem, not the
- * upstream's, so they count as successes.
+ * A failure is an upstream that couldn't be reached or timed out, or that
+ * answered 502, 503 or 504. Other statuses (4xx, and 500 from a single bad
+ * request) count as successes: the upstream is up and answering.
  *
  * While open, requests are rejected with 503 before any upstream call:
  *   { "error": "service_unavailable", "retry_after": <seconds_remaining> }
@@ -37,7 +45,7 @@ export const circuitBreakerFeature: Feature = {
       let outcome: Outcome = 'neutral';
       try {
         const response = await next(ctx);
-        outcome = response.status >= 500 ? 'failure' : 'success';
+        outcome = UPSTREAM_DOWN_STATUSES.has(response.status) ? 'failure' : 'success';
         return response;
       } catch (err) {
         if (err instanceof UpstreamError && !ctx.signal.aborted) outcome = 'failure';
