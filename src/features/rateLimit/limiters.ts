@@ -42,7 +42,6 @@ export function createLimiter(config: RateLimitConfig): RateLimiter {
  */
 export class FixedWindowLimiter implements RateLimiter {
   private readonly windows = new Map<string, { start: number; count: number }>();
-  private lastSweep = 0;
 
   constructor(
     private readonly limit: number,
@@ -70,12 +69,11 @@ export class FixedWindowLimiter implements RateLimiter {
   }
 
   /** Drops expired windows at most once per window length, so idle clients don't leak memory. */
+  private readonly sweeper = new IncrementalSweeper(this.windows);
+
+  /** Drops a few expired windows per request, so idle clients don't leak memory. */
   private sweep(now: number): void {
-    if (now - this.lastSweep < this.windowMs) return;
-    this.lastSweep = now;
-    for (const [key, window] of this.windows) {
-      if (now - window.start >= this.windowMs) this.windows.delete(key);
-    }
+    this.sweeper.sweep((window) => now - window.start >= this.windowMs);
   }
 }
 
@@ -88,7 +86,6 @@ export class FixedWindowLimiter implements RateLimiter {
  */
 export class SlidingWindowLimiter implements RateLimiter {
   private readonly logs = new Map<string, number[]>();
-  private lastSweep = 0;
 
   constructor(
     private readonly limit: number,
@@ -126,12 +123,41 @@ export class SlidingWindowLimiter implements RateLimiter {
     return newest === undefined ? 0 : newest + this.windowMs - now;
   }
 
+  private readonly sweeper = new IncrementalSweeper(this.logs);
+
   private sweep(now: number): void {
-    if (now - this.lastSweep < this.windowMs) return;
-    this.lastSweep = now;
-    for (const [key, log] of this.logs) {
+    this.sweeper.sweep((log) => {
       const newest = log.at(-1);
-      if (newest === undefined || newest <= now - this.windowMs) this.logs.delete(key);
+      return newest === undefined || newest <= now - this.windowMs;
+    });
+  }
+}
+
+/** How many tracked clients each request checks for expiry. */
+const SWEEP_BATCH = 64;
+
+/**
+ * Removes expired entries a few at a time, resuming where it left off, so the
+ * cost of cleanup is spread evenly across requests. A full scan inside one
+ * request would make that request (and, on Node's single thread, everyone
+ * else) wait while every tracked client is visited.
+ */
+class IncrementalSweeper<V> {
+  private cursor: Iterator<[string, V]>;
+
+  constructor(private readonly map: Map<string, V>) {
+    this.cursor = map.entries();
+  }
+
+  sweep(isExpired: (value: V) => boolean): void {
+    for (let checked = 0; checked < SWEEP_BATCH; checked += 1) {
+      const next = this.cursor.next();
+      if (next.done) {
+        this.cursor = this.map.entries(); // start the next pass from the beginning
+        return;
+      }
+      const [key, value] = next.value;
+      if (isExpired(value)) this.map.delete(key); // deleting during iteration is safe for a Map
     }
   }
 }

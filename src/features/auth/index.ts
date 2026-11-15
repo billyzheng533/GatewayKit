@@ -26,16 +26,19 @@ export const authFeature: Feature = {
     const challenge = { 'www-authenticate': `ApiKey header="${config.header}"` };
 
     return async (ctx, next) => {
-      const provided = ctx.request.headers[headerName];
+      // headersDistinct, not headers: Node silently keeps only the first copy of some
+      // headers (Authorization among them), which would hide a duplicate.
+      const values = ctx.request.headersDistinct[headerName] ?? [];
+      const provided = values[0];
 
       if (provided === undefined || provided === '') {
         return errorResponse(
           new GatewayError(401, 'unauthorized', `missing API key: send it in the ${config.header} header`, challenge),
         );
       }
-      // Several copies of the header arrive as an array (or joined with ", "):
-      // never a valid single key, so it simply fails the comparison.
-      if (Array.isArray(provided) || !keyMatches(provided, keyDigests)) {
+      // A key header sent more than once is rejected, even if one copy is valid:
+      // which copy counts shouldn't be up to the client.
+      if (values.length > 1 || !keyMatches(provided, keyDigests)) {
         return errorResponse(new GatewayError(401, 'unauthorized', 'invalid API key', challenge));
       }
 

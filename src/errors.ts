@@ -84,6 +84,17 @@ export class CircuitOpenError extends GatewayError {
 }
 
 /**
+ * The client went away before its request body arrived. Nothing is sent back
+ * (there's no one to send it to); the server just stops. 499 is nginx's
+ * convention for this, and only appears in internal handling.
+ */
+export class ClientClosedError extends GatewayError {
+  constructor() {
+    super(499, 'client_closed_request', 'client disconnected while sending the request body');
+  }
+}
+
+/**
  * The request body is over the limit: 413. No `Connection: close` here: Node
  * would close the socket while the client is still uploading, and the client
  * would see a broken pipe instead of this response. The server drains the

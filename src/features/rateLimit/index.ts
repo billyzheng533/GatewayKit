@@ -1,4 +1,5 @@
 import { GatewayError, errorResponse } from '../../errors.js';
+import { secondsUntil } from '../../time.js';
 import type { Feature } from '../index.js';
 import { createLimiter, type RateLimitDecision } from './limiters.js';
 
@@ -25,7 +26,7 @@ export const rateLimitFeature: Feature = {
       const headers = rateLimitHeaders(decision);
 
       if (!decision.allowed) {
-        const retryAfter = toSeconds(decision.retryAfterMs);
+        const retryAfter = secondsUntil(decision.retryAfterMs);
         return errorResponse(
           new GatewayError(
             429,
@@ -37,8 +38,14 @@ export const rateLimitFeature: Feature = {
         );
       }
 
-      const response = await next(ctx);
-      return { ...response, headers: { ...response.headers, ...headers } };
+      try {
+        const response = await next(ctx);
+        return { ...response, headers: { ...response.headers, ...headers } };
+      } catch (err) {
+        // Errors become responses later (502, 504, ...); they should carry the budget too.
+        if (err instanceof GatewayError) Object.assign(err.headers, headers);
+        throw err;
+      }
     };
   },
 };
@@ -47,11 +54,8 @@ function rateLimitHeaders(decision: RateLimitDecision): Record<string, string> {
   return {
     'x-ratelimit-limit': String(decision.limit),
     'x-ratelimit-remaining': String(decision.remaining),
-    'x-ratelimit-reset': String(toSeconds(decision.resetMs)),
+    'x-ratelimit-reset': String(secondsUntil(decision.resetMs)),
   };
 }
 
-/** Whole seconds, rounded up so clients never retry too early; at least 1 while waiting. */
-function toSeconds(ms: number): number {
-  return ms <= 0 ? 0 : Math.max(1, Math.ceil(ms / 1000));
-}
+

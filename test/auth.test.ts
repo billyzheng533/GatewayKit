@@ -1,4 +1,5 @@
 import http from 'node:http';
+import net from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { digest, keyMatches } from '../src/features/auth/index.js';
 import type { RunningGateway } from '../src/server.js';
@@ -27,6 +28,12 @@ routes:
     upstream: { url: "${internal.url}" }
     auth: { type: "api_key", header: "X-Service-Token", keys: ["svc_token_1"] }
 
+  # Auth on Authorization, a header Node normally de-duplicates by keeping only the first copy.
+  - path: "/api/authz"
+    methods: ["GET"]
+    upstream: { url: "${internal.url}" }
+    auth: { type: "api_key", header: "Authorization", keys: ["${KEY_A}"] }
+
   # Auth together with rate limiting and a circuit breaker.
   - path: "/api/guarded"
     methods: ["GET"]
@@ -49,6 +56,20 @@ afterAll(async () => {
 const send = (path: string, headers: Record<string, string> = {}, init: RequestInit = {}) =>
   fetch(`${gateway.url}${path}`, { ...init, headers });
 const internalHits = () => internal.requests.length;
+
+/** Sends `name` twice over a raw socket, since HTTP clients may merge or reject duplicates. */
+function rawTwice(path: string, name: string, values: string[]): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(gateway.port, '127.0.0.1', () => {
+      const headerLines = values.map((value) => `${name}: ${value}\r\n`).join('');
+      socket.write(`GET ${path} HTTP/1.1\r\nHost: localhost\r\n${headerLines}Connection: close\r\n\r\n`);
+    });
+    let data = '';
+    socket.on('data', (chunk) => (data += chunk));
+    socket.on('end', () => resolve(Number(data.split(' ')[1])));
+    socket.on('error', reject);
+  });
+}
 
 /** Raw request, for things fetch won't do: duplicate headers, un-normalized paths. */
 function rawGet(path: string, headers: http.OutgoingHttpHeaders): Promise<number> {
@@ -141,6 +162,13 @@ describe('API key auth failures', () => {
 
   it('returns 401 when the key header is sent twice, even if one copy is valid', async () => {
     expect(await rawGet('/api/internal/secret', { 'x-api-key': [KEY_A, 'sk_live_wrong'] })).toBe(401);
+  });
+
+  it('returns 401 when Authorization is sent twice, even though Node would keep only the first copy', async () => {
+    const before = internalHits();
+    expect(await rawGet('/api/authz/x', { authorization: KEY_A })).toBe(200);
+    expect(await rawTwice('/api/authz/x', 'Authorization', [KEY_A, 'anything'])).toBe(401);
+    expect(internalHits()).toBe(before + 1);
   });
 
   it('cannot be dodged with ".." through an open route', async () => {

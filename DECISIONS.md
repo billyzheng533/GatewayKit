@@ -77,11 +77,11 @@ client → Node's HTTP parser               → 431 if request line + headers > 
            ├─ GET /health                 → 200 (built in, before routing)
            ├─ router.match(path)          → 404 if no route
            ├─ method allowed?             → 405 + Allow header if not
-           ├─ read body (10 MB cap)       → 413 if larger
            └─ route.handler(ctx)          ← composed once at startup, per route:
                  rate_limit (429) → auth (401) → retry → circuit_breaker (503)
-                   → upstream handler (load balancer picks a healthy target; 503 if none) → UpstreamClient
-                   → upstream (502 unreachable, 504 timeout)
+                   → upstream handler (load balancer picks a healthy target; 503 if none)
+                   → read body (10 MB cap; 413 if larger), only now, once rejections are done
+                   → UpstreamClient → upstream (502 unreachable, 504 timeout)
          ← response written once, by the server
 ```
 
@@ -141,12 +141,17 @@ Key choices:
   are encoded slashes (`%2F`), backslashes and null bytes: upstreams disagree on whether those
   separate path segments, which is the usual way routing gets bypassed. Logs record the path as the
   client sent it, so attempts are visible.
-- Every request gets an `X-Request-Id` (the client's, or a new UUID). It is forwarded upstream,
-  returned to the client and included in log lines, so one request can be traced across services.
-- **Request bodies are buffered** (capped at 10 MB → 413). That's needed to replay a body on retry, and
-  will be needed to rewrite it in `request_transform`. The trade-off is memory per in-flight request and
-  no streaming uploads; a production version would buffer only on routes that need it and stream
-  otherwise.
+- Every request gets an `X-Request-Id`. It is forwarded upstream, returned to the client and included
+  in log lines, so one request can be traced across services. A client's own ID is kept only if it's
+  short and made of safe characters (up to 128 of `A-Z a-z 0-9 . _ : -`); otherwise a new UUID is used,
+  so a client can't bloat log lines or forge another request's ID.
+- **Request bodies are buffered, but only once a request will actually be forwarded** (capped at
+  10 MB → 413). Buffering is needed to replay a body on retry, and will be needed to rewrite it in
+  `request_transform`. The body is read lazily by the upstream handler, after rate limiting and auth,
+  so a rejected request never costs a buffered body. Before a code review caught this, an
+  unauthenticated client could make the gateway hold 10 MB per upload before it answered 401. The
+  remaining trade-off is memory per forwarded request and no streaming uploads; a production version
+  would stream on routes that need neither retry nor transforms.
 - **Request line and headers are capped at 16 KB** (431), which is where the query string lives. The
   limit is set explicitly on the server rather than inherited from Node's default, so it can't change
   underneath us. AWS API Gateway's HTTP APIs allow 10,240 bytes; 16 KB is a bit more generous for long
@@ -178,7 +183,8 @@ nothing from the client** that it could fake, and **never write secrets anywhere
 | Escaping a route's prefix with `..` (`/api/products/../internal`) | Paths are normalized before routing, so the request is routed (and authenticated) as what it really is. Climbing above `/` is a 400. |
 | Encoded slashes, backslashes, null bytes in paths | 400. Upstreams disagree on how to read them, which is the classic way to get the gateway and the upstream to see different paths. |
 | Faking a client IP to dodge rate limits | `X-Forwarded-For` from the client is passed along but never used to identify the client; the socket address is. |
-| Exhausting gateway memory | 10 MB body limit (413), 16 KB limit on request line + headers (431), idle rate limit counters swept, oversized uploads drained for at most 5 seconds. |
+| Exhausting gateway memory | Bodies are read only after rate limiting and auth pass, so rejected requests buffer nothing; 10 MB body limit (413); 16 KB limit on request line + headers (431); idle rate limit counters cleaned up; oversized uploads drained for at most 5 seconds. |
+| Forging log entries | A client's `X-Request-Id` is used only if it's a short, safe ID; otherwise the gateway generates one. |
 | Malformed or hostile HTTP | Rejected by Node's parser with a JSON 400 before any gateway code runs; hop-by-hop headers are never forwarded. |
 | Retries making things worse | POST/PATCH are only retried if the request provably never arrived (no duplicate orders); the circuit breaker stops retries against a failing upstream; exponential backoff is capped. |
 | A slow or dead upstream tying up the gateway | Timeouts on every upstream call, circuit breakers, health checks, and cancelling upstream work when the client disconnects. |
@@ -239,7 +245,7 @@ The brief says ambiguities are intentional; these are the calls I made:
 | Is the key forwarded to the upstream? | No. Authentication ends at the gateway, so the header is removed. The upstream and its logs never see the client's secret. |
 | Is the key logged? | No. Access logs record method, path, route and status, never headers. |
 | Header name case | Case-insensitive, like all HTTP headers: `X-API-Key` and `x-api-key` both work. Key values are case-sensitive. |
-| The key header sent twice | 401, even if one copy is valid. Which copy the gateway checks shouldn't be up to the client. |
+| The key header sent twice | 401, even if one copy is valid. Which copy the gateway checks shouldn't be up to the client. The check reads every copy the client sent (`req.headersDistinct`), because Node's usual header object silently keeps only the first copy of some headers, `Authorization` among them; a code review caught that, and there's a test for it. |
 | Auth before or after rate limiting? | After. If auth ran first, rejected requests would never reach the rate limiter, and someone could try keys as fast as the network allows. Now every failed guess uses up that client's budget. The trade-off: on a route with `per: "global"`, unauthenticated requests use up the shared budget too, so an attacker could crowd out legitimate users. A production version would add a separate limit on failed auth attempts. |
 | Do 401s count as circuit breaker failures? | No. Auth rejects before any upstream call, so the upstream's health isn't involved. |
 | Bypass with `..` through an open route | Not possible: paths are normalized first, so `/api/open/../internal` is routed (and authenticated) as `/api/internal`. |
@@ -281,9 +287,9 @@ The brief says ambiguities are intentional; these are the calls I made:
 | `sliding_window` | A sliding log: the timestamps of admitted requests in the last `window`. Exact, with no boundary burst. Memory is at most `requests` timestamps per client, fine for the limits a gateway config uses; very large limits would call for a sliding window *counter* instead. |
 | `per: "ip"` vs `"global"` | Per client socket address, or one budget shared by every client on that route. `X-Forwarded-For` is ignored for this, so a client can't dodge its limit by making up addresses. |
 | Do rejected requests count? | No. Only admitted requests use up budget, so a client hammering away while blocked recovers on schedule. Requests refused with 404 or 405 don't count either; rate limiting runs after routing and method checks. |
-| What does a client see? | 429 `{ "error": "rate_limited", "message": "...", "retry_after": <seconds> }` with a `Retry-After` header. Every response on a rate-limited route carries `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset` (seconds until the budget is full again). |
+| What does a client see? | 429 `{ "error": "rate_limited", "message": "...", "retry_after": <seconds> }` with a `Retry-After` header. Every response on a rate-limited route carries `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset` (seconds until the budget is full again), including gateway errors such as a 502, since those requests used budget too. |
 | 50 simultaneous requests | Exactly `requests` get through. Each check-and-increment is synchronous on Node's single thread, so concurrent requests can't race on a counter. There's a test for exactly this. |
-| Memory for many clients | Idle clients' counters are swept once per window, so memory tracks active clients rather than every client ever seen. |
+| Memory for many clients | Idle clients' counters are removed a small batch at a time (64 per request), resuming where the last batch stopped. Memory tracks active clients rather than every client ever seen, and no single request pays for scanning all of them. |
 | Where in the pipeline? | Outermost, before auth, retry and the breaker: rejecting an over-limit client is the cheapest thing the gateway can do. Running before auth is deliberate; see the auth table. |
 | Running several gateway instances | Limits are per instance (in memory). A shared store like Redis would be needed for a cluster-wide limit. |
 
@@ -337,6 +343,13 @@ The brief says ambiguities are intentional; these are the calls I made:
     with the example config (interval shortened to 1s, `products-b` stopped): after 3 failed checks,
     all `/api/products` traffic went to `products-a`. Also added a test for starting on a port
     that's already in use.
+13. **Code review.** A review of all the source turned up 10 issues, all fixed with tests that fail
+    against the old code. The serious ones were security: request bodies were buffered before auth
+    and rate limiting ran, a duplicated `Authorization` header slipped past the duplicate-key check,
+    and a client could set any `X-Request-Id`. Also fixed: client hang-ups logged as malformed
+    requests, rate limit cleanup scanning every client inside one request, missing rate limit headers
+    on 502s, health check rounds that could crash the process on an unexpected error, and three bits
+    of duplicated logic.
 
 ### Done and tested
 

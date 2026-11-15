@@ -3,7 +3,7 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { pipeline } from 'node:stream/promises';
 import type { GatewayConfig, RouteConfig } from './config/types.js';
-import { GatewayError, PayloadTooLargeError } from './errors.js';
+import { ClientClosedError, GatewayError, PayloadTooLargeError } from './errors.js';
 import { buildRouteMiddleware } from './features/index.js';
 import { silentLogger, type Logger } from './logger.js';
 import { compose, type GatewayResponse, type Handler, type RequestContext } from './pipeline.js';
@@ -82,7 +82,8 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
   // Requests Node rejects while parsing (too-large headers, malformed HTTP) never
   // reach handleRequest. Answer them in the same JSON error format as everything else.
   server.on('clientError', (err: NodeJS.ErrnoException, socket) => {
-    if (err.code === 'ECONNRESET' || !socket.writable) {
+    // A client that hangs up (even mid-upload) isn't sending malformed HTTP: just close quietly.
+    if ((err.code !== undefined && CLIENT_GONE_CODES.has(err.code)) || !socket.writable) {
       socket.destroy();
       return;
     }
@@ -107,7 +108,7 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
     const started = performance.now();
     const method = (req.method ?? 'GET').toUpperCase();
     const { path: rawPath, query } = splitUrl(req.url ?? '/');
-    const requestId = singleHeader(req.headers['x-request-id']) ?? randomUUID();
+    const requestId = acceptableRequestId(singleHeader(req.headers['x-request-id'])) ?? randomUUID();
     let routePath: string | undefined;
 
     res.setHeader('x-request-id', requestId);
@@ -161,7 +162,7 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
 
     let response: GatewayResponse;
     try {
-      const body = await readBody(req, MAX_BODY_BYTES);
+      let bodyRead: Promise<Buffer> | undefined;
       const ctx: RequestContext = {
         route: route.config,
         request: {
@@ -169,7 +170,9 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
           path,
           query,
           headers: req.headers,
-          body,
+          headersDistinct: req.headersDistinct,
+          // Lazy and memoized: read on first call (by the upstream handler), reused on retries.
+          readBody: () => (bodyRead ??= readBody(req, MAX_BODY_BYTES)),
           clientIp: req.socket.remoteAddress ?? 'unknown',
         },
         requestId,
@@ -178,7 +181,7 @@ export async function startGateway(config: GatewayConfig, options: GatewayOption
       };
       response = await route.handler(ctx);
     } catch (err) {
-      if (abort.signal.aborted) return; // client is gone; nothing to send
+      if (abort.signal.aborted || err instanceof ClientClosedError) return; // client is gone; nothing to send
       if (err instanceof GatewayError) {
         logger.warn('request failed', { request_id: requestId, route: route.path, status: err.status, error: err.message });
         return sendError(res, err);
@@ -223,6 +226,19 @@ function splitUrl(rawUrl: string): { path: string; query: string } {
   return q === -1 ? { path: rawUrl, query: '' } : { path: rawUrl.slice(0, q), query: rawUrl.slice(q) };
 }
 
+/** Parser errors that mean the client went away, not that it sent bad HTTP. */
+const CLIENT_GONE_CODES = new Set(['ECONNRESET', 'EPIPE', 'HPE_INVALID_EOF_STATE']);
+
+/**
+ * A client-supplied X-Request-Id is kept only if it looks like an ID: short and
+ * made of safe characters. Anything else (very long, odd characters) is
+ * replaced with a fresh UUID, so a client can't bloat logs or forge entries.
+ */
+const SAFE_REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+function acceptableRequestId(value: string | undefined): string | undefined {
+  return value !== undefined && SAFE_REQUEST_ID.test(value) ? value : undefined;
+}
+
 function singleHeader(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
@@ -262,7 +278,7 @@ function readBody(req: IncomingMessage, limitBytes: number): Promise<Buffer> {
     };
     const onClose = () => {
       cleanup();
-      if (!req.complete) reject(new Error('client disconnected while sending the request body'));
+      if (!req.complete) reject(new ClientClosedError());
     };
     req.on('data', onData);
     req.on('end', onEnd);

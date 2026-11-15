@@ -90,6 +90,18 @@ describe('HealthChecker state', () => {
     await first;
   });
 
+  it('logs a failed round instead of crashing the process', async () => {
+    const errors: string[] = [];
+    const logger: Logger = { info: () => {}, warn: () => {}, error: (m) => errors.push(m) };
+    const throwingProbe: Probe = () => Promise.reject(new Error('probe bug'));
+    const checker = new HealthChecker('/r', [a], { ...config, intervalMs: 20 }, 1_000, logger, throwingProbe);
+    checker.start();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    checker.stop();
+    expect(errors.length).toBeGreaterThan(0);
+    expect(errors[0]).toBe('health check round failed');
+  });
+
   it('ignores results that arrive after stop()', async () => {
     let release!: () => void;
     const probe: Probe = () => new Promise((resolve) => (release = () => resolve({ ok: false, reason: 'status 503', status: 503 })));
@@ -147,6 +159,13 @@ describe('httpProbe', () => {
 
   it('fails when the target refuses the connection', async () => {
     expect(await httpProbe(new URL(`http://127.0.0.1:${deadPort}/healthz`), 500, never)).toEqual({
+      ok: false,
+      reason: 'connection refused',
+    });
+  });
+
+  it('describes a refused connection to "localhost" (IPv6 and IPv4 both tried) the same way', async () => {
+    expect(await httpProbe(new URL(`http://localhost:${deadPort}/healthz`), 500, never)).toEqual({
       ok: false,
       reason: 'connection refused',
     });

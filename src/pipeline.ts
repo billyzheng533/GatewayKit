@@ -24,10 +24,21 @@ export interface GatewayRequest {
   path: string;
   /** Raw query string including the leading "?", or "" when absent. */
   query: string;
-  /** Lower-cased header names, as Node provides them. */
+  /** Lower-cased header names, as Node provides them (some duplicates joined, some dropped). */
   headers: IncomingHttpHeaders;
-  /** Fully buffered so it can be replayed on retry and rewritten by transforms. */
-  body: Buffer;
+  /**
+   * Every header with all the values received, never joined or dropped. Use this
+   * when a header appearing twice matters (auth): Node keeps only the first
+   * `Authorization` in `headers`, but joins duplicate custom headers with ", ".
+   */
+  headersDistinct: Record<string, string[] | undefined>;
+  /**
+   * Reads the body, buffered (so it can be replayed on retry) and capped at the
+   * size limit. Lazy: only the upstream handler calls it, so middleware that
+   * rejects a request (rate limiting, auth) runs before any body is buffered.
+   * Repeated calls (retries) get the same buffer.
+   */
+  readBody(): Promise<Buffer>;
   clientIp: string;
 }
 

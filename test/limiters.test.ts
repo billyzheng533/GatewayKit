@@ -98,3 +98,26 @@ describe('createLimiter', () => {
     expect(createLimiter({ ...base, strategy: 'sliding_window' })).toBeInstanceOf(SlidingWindowLimiter);
   });
 });
+
+describe('cleanup of idle clients', () => {
+  it('checks only a small batch per request, and clears every idle client over a few requests', () => {
+    const limiter = new FixedWindowLimiter(5, 1_000);
+    for (let i = 0; i < 500; i += 1) limiter.consume(`idle-${i}`, 0);
+    expect(limiter.size).toBe(500);
+
+    limiter.consume('active', 2_000); // all 500 have expired; one request removes only a batch
+    expect(limiter.size).toBeGreaterThan(400);
+
+    for (let i = 0; i < 20; i += 1) limiter.consume('active', 2_000);
+    expect(limiter.size).toBe(1);
+  });
+
+  it('works the same for the sliding window', () => {
+    const limiter = new SlidingWindowLimiter(5, 1_000);
+    for (let i = 0; i < 500; i += 1) limiter.consume(`idle-${i}`, 0);
+    limiter.consume('active', 2_000);
+    expect(limiter.size).toBeGreaterThan(400);
+    for (let i = 0; i < 20; i += 1) limiter.consume('active', 2_000);
+    expect(limiter.size).toBe(1);
+  });
+});

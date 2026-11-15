@@ -22,11 +22,12 @@ export class UpstreamClient {
    * The timeout covers time-to-headers only; once streaming starts, the body
    * is relayed until the upstream finishes or the client disconnects.
    */
-  send(ctx: RequestContext, target: URL, timeoutMs: number): Promise<GatewayResponse> {
+  async send(ctx: RequestContext, target: URL, timeoutMs: number): Promise<GatewayResponse> {
     const { request } = ctx;
+    // Read (or reuse, on retry) the body only now, after every rejecting middleware has run.
+    const body = await request.readBody();
     const isHttps = target.protocol === 'https:';
-    const basePath = target.pathname.replace(/\/+$/, '');
-    const path = basePath + upstreamPath(ctx.route, request.path) + request.query;
+    const path = joinTargetPath(target, upstreamPath(ctx.route, request.path)) + request.query;
     const targetLabel = target.origin;
 
     return new Promise((resolve, reject) => {
@@ -49,7 +50,7 @@ export class UpstreamClient {
             clientIp: request.clientIp,
             requestId: ctx.requestId,
             upstreamHost: target.host,
-            bodyLength: request.body.length,
+            bodyLength: body.length,
           }),
           agent: isHttps ? this.httpsAgent : this.httpAgent,
           signal: ctx.signal,
@@ -78,7 +79,7 @@ export class UpstreamClient {
         const { error, code } = describeConnectError(err);
         fail(new UpstreamUnavailableError(targetLabel, error, code));
       });
-      upstreamReq.end(request.body);
+      upstreamReq.end(body);
     });
   }
 
@@ -93,7 +94,12 @@ export class UpstreamClient {
  * Node reports an AggregateError whose message is empty. Surface the error
  * code (e.g. ECONNREFUSED) so logs and 502 bodies say what actually happened.
  */
-function describeConnectError(err: Error): { error: Error; code?: string } {
+/** A target's own base path plus `path`: `http://svc/v2` + `/items` is `/v2/items`. */
+export function joinTargetPath(target: URL, path: string): string {
+  return target.pathname.replace(/\/+$/, '') + path;
+}
+
+export function describeConnectError(err: Error): { error: Error; code?: string } {
   const inner = err instanceof AggregateError && err.errors[0] instanceof Error ? err.errors[0] : err;
   const code = (err as NodeJS.ErrnoException).code ?? (inner as NodeJS.ErrnoException).code;
   const message = err.message || inner.message;

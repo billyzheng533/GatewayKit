@@ -1,4 +1,5 @@
 import { CircuitOpenError, UpstreamError } from '../../errors.js';
+import { secondsUntil } from '../../time.js';
 import type { Feature } from '../index.js';
 import { CircuitBreaker, type Outcome } from './breaker.js';
 
@@ -29,7 +30,8 @@ export const circuitBreakerFeature: Feature = {
     return async (ctx, next) => {
       const permit = breaker.tryAcquire(now());
       if (!permit.allowed) {
-        throw new CircuitOpenError(Math.max(1, Math.ceil(permit.retryAfterMs / 1000)));
+        // At least 1: while a half-open trial is in flight there's no fixed end, but "retry now" would be wrong.
+        throw new CircuitOpenError(Math.max(1, secondsUntil(permit.retryAfterMs)));
       }
 
       let outcome: Outcome = 'neutral';

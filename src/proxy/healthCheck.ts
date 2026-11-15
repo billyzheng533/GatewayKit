@@ -2,6 +2,7 @@ import http from 'node:http';
 import https from 'node:https';
 import type { HealthCheckConfig, UpstreamTarget } from '../config/types.js';
 import type { Logger } from '../logger.js';
+import { describeConnectError, joinTargetPath } from './client.js';
 
 /**
  * Active health checks for one route's upstream targets.
@@ -56,8 +57,13 @@ export class HealthChecker {
       interval_ms: this.config.intervalMs,
       unhealthy_threshold: this.config.unhealthyThreshold,
     });
-    void this.checkAll();
-    this.timer = setInterval(() => void this.checkAll(), this.config.intervalMs);
+    const round = () =>
+      this.checkAll().catch((err: unknown) => {
+        // A bug in one round must never take the gateway down (an unhandled rejection would).
+        this.logger.error('health check round failed', { route: this.routePath, error: String(err) });
+      });
+    void round();
+    this.timer = setInterval(() => void round(), this.config.intervalMs);
     this.timer.unref();
   }
 
@@ -116,7 +122,7 @@ export class HealthChecker {
 /** The health check path is relative to the target, including any base path in its URL. */
 export function healthCheckUrl(target: URL, path: string): URL {
   const url = new URL(target.href);
-  url.pathname = target.pathname.replace(/\/+$/, '') + path.split('?')[0];
+  url.pathname = joinTargetPath(target, path.split('?')[0] as string);
   url.search = path.includes('?') ? path.slice(path.indexOf('?')) : '';
   return url;
 }
@@ -145,9 +151,10 @@ export const httpProbe: Probe = (url, timeoutMs, signal) =>
         resolve(status >= 200 && status < 300 ? { ok: true } : { ok: false, reason: `status ${status}`, status });
       },
     );
-    req.on('error', (err: NodeJS.ErrnoException) => {
-      if (timeout.aborted) resolve({ ok: false, reason: `timed out after ${timeoutMs}ms` });
-      else if (err.code === 'ECONNREFUSED') resolve({ ok: false, reason: 'connection refused' });
-      else resolve({ ok: false, reason: err.code ?? err.message ?? 'request failed' });
+    req.on('error', (err: Error) => {
+      if (timeout.aborted) return resolve({ ok: false, reason: `timed out after ${timeoutMs}ms` });
+      // Same description the proxy uses, including dual-stack "localhost" failures.
+      const { error, code } = describeConnectError(err);
+      resolve({ ok: false, reason: code === 'ECONNREFUSED' ? 'connection refused' : error.message });
     });
   });
